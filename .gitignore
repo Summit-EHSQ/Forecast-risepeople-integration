@@ -1,0 +1,5 @@
+# Local HR sample exports and secrets
+samples/
+.env
+.env.*
+!.env.example

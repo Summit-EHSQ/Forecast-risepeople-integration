@@ -1,0 +1,3842 @@
+openapi: 3.1.0
+
+info:
+  title: Rise People Directory API
+  version: 1.0.0
+  description: |
+    Read and manage the people records that Rise holds for your organization.
+
+    ## Authentication
+
+    Every request must include an OAuth 2.0 access token in the `Authorization`
+    header. A token is scoped to a single organization and to the set of
+    operations its client is entitled to call.
+
+    ## Errors
+
+    A failure arrives in one of two bodies, and the `Content-Type` of the
+    response tells you which one you got.
+
+    * An `application/json` body has an `errors` array. Each entry has a stable
+      machine-readable `code` and a human-readable `detail`. A request that
+      breaks several rules at once reports all of them in one response.
+    * An `application/problem+json` body is an RFC 7807 problem document.
+
+    Both are documented below as the `Error` and `ProblemDetails` schemas. A
+    given status code may arrive as either, so branch on `Content-Type` rather
+    than on the status alone. Error responses do not negotiate `Accept`: a
+    request that asked for `application/json` can still receive
+    `application/problem+json`.
+
+    Every response includes an `X-Request-Id` header. Quote it when reporting a
+    problem.
+
+    The `code` values an `errors` entry can have:
+
+    | Status | Code | Meaning |
+    |---|---|---|
+    | 400 | `invalid_params` | A parameter or body member is unknown, missing, or the wrong shape. |
+    | 400 | `key_not_included_in_url` | The `id` in the body does not match the id in the path. |
+    | 401 | `unauthorized` | The access token is missing or not valid. |
+    | 403 | `forbidden` | The caller is not permitted to perform this operation. |
+    | 403 | `field_not_permitted` | The request changes an attribute the caller may not change. |
+    | 403 | `payroll_not_enabled` | Payroll is not enabled for your organization. |
+    | 404 | `not_found` | The record does not exist or is not visible to the caller. |
+    | 406 | `not_acceptable` | The `Accept` header allows no media type this API can return. |
+    | 409 | `employee_already_exists` | An employee with the same first name, last name and employee code exists. |
+    | 409 | `effective_date_overlap` | Another change already sets the same thing on that date. |
+    | 409 | `already_reversed` | The journey event has already been reversed. |
+    | 415 | `unsupported_media_type` | The request body is not sent as `application/json`. |
+    | 422 | `validation_failed` | A value breaks one of Rise's rules. |
+    | 422 | `duplicate_employee_code` | The employee code is already in use. |
+    | 422 | `duplicate_payroll_department_code` | A department's payroll code is already in use in payroll. |
+    | 422 | `not_reversible` | The journey event cannot be reversed. |
+    | 422 | `payroll_rejected` | Payroll rejected the change, and nothing was changed. |
+    | 500 | `internal_error` | An unexpected error. |
+
+    ## Pagination
+
+    List operations are paginated with `page[number]` and `page[size]`, and
+    report the total number of matching records in `meta.count`.
+
+servers:
+  - url: https://api.risepeople.com/v1
+    description: Production
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Employees
+    description: >
+      The people in your organization: their profiles, and the managers,
+      positions, teams, departments and locations they are placed with.
+  - name: Journey events
+    description: >
+      Dated changes to an employee's employment (hire, status, position,
+      compensation and manager changes), and their reversal.
+  - name: Emergency contacts
+    description: >
+      The people to reach on an employee's behalf in an emergency.
+  - name: Onboarding
+    description: >
+      New hires being set up before their first day, and their progress
+      towards approval.
+  - name: Organization
+    description: >
+      Your organization's structure: teams, departments, positions and the
+      payroll organizations it is connected to.
+
+paths:
+  /employees:
+    get:
+      operationId: v1ListEmployees
+      x-rise-scope: ["employees:read"]
+      summary: List employees
+      tags: [Employees]
+      description: >
+        Returns a page of the people in your organization. Records are ordered
+        by last name, then by id. `is_on_leadership_team` orders them by when
+        they joined the leadership team instead; the order cannot otherwise be
+        changed.
+
+
+        People who have not finished onboarding are not returned.
+
+
+        Which attributes appear on a record depends on what the caller is
+        permitted to see, so a field documented here may be absent for some
+        callers. `id`, `employment_stage` and `is_manager` are always present.
+
+
+        A caller that is not permitted to view the people directory, or not
+        permitted to view other people's profiles, receives only their own
+        record.
+
+
+        This will not return employees whose onboarding isn't completed. Use the
+        onboarding operations for this instead.
+      security:
+        - BearerAuth: ["employees:read"]
+      parameters:
+        - name: id
+          in: query
+          required: false
+          description: >
+            Return only these people. Comma-separated, for example
+            `?id=1000,1001`.
+          style: form
+          explode: false
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 100
+            items: { type: integer, minimum: 1 }
+            examples: [[1000, 1001]]
+        - name: employment_stage
+          in: query
+          required: false
+          description: >
+            Return only the people at these stages of employment.
+            Comma-separated, for example `?employment_stage=employed,not_employed`.
+          style: form
+          explode: false
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 4
+            uniqueItems: true
+            items:
+              type: string
+              enum: [awaiting_employment_details, employment_pending, employed, not_employed]
+        - name: name_search
+          in: query
+          required: false
+          description: >
+            Match against first, last and common name. First and last names
+            are searched only when the caller is permitted to read them across
+            the organization; common names are always searched.
+          schema: { type: string, minLength: 1, maxLength: 100, examples: ['Aaronson'] }
+        - name: smart_search
+          in: query
+          required: false
+          description: >
+            Match against name, employee code, and position, team and
+            department names.
+          schema: { type: string, minLength: 1, maxLength: 100, examples: ['Engineering'] }
+        - name: is_on_leadership_team
+          in: query
+          required: false
+          description: >
+            Return only the people on the leadership team. The only accepted
+            value is true; omit the parameter to return everyone. This filter
+            re-orders employees by the date when they were added to the
+            leadership team.
+          schema:
+            type: boolean
+            enum: [true]
+        - name: groups
+          in: query
+          required: false
+          description: >
+            Which kinds of primary group `within_primary_groups_of` compares.
+            Has no effect on its own. Defaults to all three. Comma-separated,
+            for example `?groups=teams,departments`.
+          style: form
+          explode: false
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 3
+            uniqueItems: true
+            items:
+              type: string
+              enum: [teams, departments, locations]
+        - name: within_primary_groups_of
+          in: query
+          required: false
+          description: >
+            Return the members of this person's primary groups, including them,
+            whether or not those groups are primary for the other members. Use
+            `groups` to choose which kinds of group count. If the person has no
+            primary group of those kinds, everyone who belongs to any team,
+            department or location is returned. This filter looks the person up
+            first, so an id that does not exist, or that the caller is not
+            permitted to see, returns 404. The other filters return an empty
+            page for such an id.
+          schema: { type: integer, minimum: 1, examples: [1000] }
+        - name: within_teams_of
+          in: query
+          required: false
+          description: >
+            Return the people who share a team with this person, excluding
+            them.
+          schema: { type: integer, minimum: 1, examples: [1000] }
+        - name: within_departments_of
+          in: query
+          required: false
+          description: >
+            Return the people who share a department with this person,
+            excluding them.
+          schema: { type: integer, minimum: 1, examples: [1000] }
+        - name: manager_id
+          in: query
+          required: false
+          description: Return the people managed by this person.
+          schema: { type: integer, minimum: 1, examples: [1000] }
+        - name: group_lead_id
+          in: query
+          required: false
+          description: >
+            Return the people in a team, department or location this person
+            leads. Includes the leader.
+          schema: { type: integer, minimum: 1, examples: [1000] }
+        - name: leader_type
+          in: query
+          required: false
+          description: >
+            Return only the people who lead others in these ways.
+            Comma-separated, for example `?leader_type=manager,group_lead`.
+          style: form
+          explode: false
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 2
+            uniqueItems: true
+            items:
+              type: string
+              enum: [manager, group_lead]
+        - name: organization_position_id
+          in: query
+          required: false
+          description: >
+            Return only the people currently holding these positions. Position
+            ids can be looked up with `GET /organization_positions`.
+            Comma-separated, for example `?organization_position_id=500,501`.
+          style: form
+          explode: false
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 100
+            items: { type: integer, minimum: 1 }
+            examples: [[500, 501]]
+        - name: page[number]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: page[size]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: A page of employees.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/EmployeeList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+    post:
+      operationId: v1CreateEmployee
+      x-rise-scope: ["employees:write"]
+      summary: Create an employee
+      description: >
+        Creates one person in your organization, hired effective `start_date`,
+        and returns their record: their `employment_stage` is `employed`, or
+        `employment_pending` if the date is in the future.
+
+
+        The body you send and the record you get back are different documents.
+        The body is an `EmployeeCreateRequest`, which places the person with
+        lists of team, location, department and manager ids and a position name.
+        The record returned is an `Employee`, which reports that placement as
+        its `primary_*` attributes: the first id in each list becomes the
+        primary one.
+
+
+        Sending `payroll_organization_id` also enrols the person in that payroll
+        organization. `department_ids`, `government_identifier_number`,
+        `date_of_birth`, `gender` and the home address (`address_line_one`,
+        `city`, `postal_code`, `country_code`, `region_code`) are then required,
+        `country_code` and `country_code_of_employment` must both be `CA`, and
+        `compensation_method` and `pay_rate` cannot be sent. If payroll is not
+        enabled for your organization, the request fails with 403 and the code
+        `payroll_not_enabled`. If payroll rejects the request, nothing is
+        created and the request fails with 422 and the code `payroll_rejected`.
+
+
+        Creating an employee whose first name, last name and employee code all
+        match a person your organization already has fails with 409.
+
+
+        The address `preferred_email_type` names is the one the person will
+        sign in with. If it is already someone's sign-in address, the request
+        is refused with 422, naming the field that holds it.
+
+
+        The returned record includes only the attributes the caller is permitted
+        to read.
+      tags: [Employees]
+      security:
+        - BearerAuth: ["employees:write"]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmployeeCreateRequest'
+      responses:
+        '201':
+          description: The employee that was created.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/EmployeeDocument'
+        '400': { $ref: '#/components/responses/WriteBadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '409':
+          description: >
+            Either an employee with the same first name, last name and employee
+            code already exists (an `Error` body with the code
+            `employee_already_exists`), or the `Idempotency-Key` sent with this
+            request was already used with a different payload (a
+            `ProblemDetails` body). `Content-Type` tells the two apart.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422':
+          description: >
+            The employee was not created. A value is invalid, a required field
+            is missing, or the login email address is already in use
+            (`validation_failed`); payroll rejected the request
+            (`payroll_rejected`); or one of the person's departments could not
+            be set up in payroll because its payroll department code is already
+            in use there (`duplicate_payroll_department_code`). The `errors`
+            array names what was rejected.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /employees/{employee_id}:
+    get:
+      operationId: v1GetEmployee
+      x-rise-scope: ["employees:read"]
+      summary: Get an employee
+      tags: [Employees]
+      description: >
+        Returns one person in your organization: their identity, contact details
+        and employment status, plus their primary position, manager, team,
+        department and location as identifiers with names alongside. The record
+        has the same shape as a record from the employees list.
+
+
+        Which attributes appear depends on what the caller is permitted to see
+        for this person, so a field documented here may be absent for some
+        callers. `id`, `employment_stage` and `is_manager` are always present.
+
+
+        Unlike the employees list, this operation returns people who have not
+        finished onboarding, when the caller is permitted to see them. Use `GET
+        /onboardings` to discover the ids of onboarding employees.
+
+
+        Returns 404 for a person who does not exist, belongs to another
+        organization, or is not visible to the caller. A caller that is not
+        permitted to view the people directory, or not permitted to view other
+        people's profiles, can read only their own record.
+      security:
+        - BearerAuth: ["employees:read"]
+      parameters:
+        - name: employee_id
+          in: path
+          required: true
+          description: Identifier of the employee to return.
+          schema: { type: integer, minimum: 1, examples: [1000] }
+      responses:
+        '200':
+          description: The employee.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/EmployeeDocument'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+    patch:
+      operationId: v1UpdateEmployee
+      x-rise-scope: ["employees:write"]
+      summary: Update an employee
+      description: >
+        Changes one or more attributes of one person in your organization and
+        returns their record. Attributes absent from the request are left
+        unchanged; send `null` to clear an attribute that allows it. A person's
+        teams, locations, departments, managers, positions, compensation and
+        payroll enrolment cannot be changed with this operation, but which of
+        their existing managers, departments, teams, locations and position
+        assignments is primary can be. Naming a primary the person does not
+        already have fails with 422 and the code `validation_failed`.
+
+
+        Which attributes the caller may change depends on whose record it is:
+        the caller's own, someone who reports to them, or anyone else.
+        `primary_manager_id` and `primary_position_id` follow the same rule,
+        using the permission to edit a person's journey. Four attributes are
+        organization-level instead, so whose record it is does not matter:
+        `is_on_leadership_team` needs the organization-information permission,
+        and `primary_department_id`, `primary_team_id` and `primary_location_id`
+        need permission to edit the organization's departments, teams and
+        locations respectively. A request that includes an attribute the caller
+        may not change for this person fails with 403 and the code
+        `field_not_permitted`, naming the attributes, and nothing is changed.
+
+
+        Depending on the caller's permissions, a change to some attributes needs
+        approval before it takes effect. Such a change is submitted to your
+        organization's approvers instead of being applied: the request still
+        succeeds and the returned record shows the value from before the change.
+        The other attributes in the same request are applied immediately.
+
+
+        When the person is enrolled in payroll, the change is sent to payroll as
+        well. If payroll is not enabled for your organization, the request fails
+        with 403 and the code `payroll_not_enabled`. If payroll rejects the
+        change, nothing is changed and the request fails with 422 and the code
+        `payroll_rejected`.
+
+
+        Returns 404 for a person who does not exist, belongs to another
+        organization, or is not visible to the caller. The returned record
+        includes only the attributes the caller is permitted to read.
+
+
+        For a person who has not finished onboarding, `home_email` and
+        `work_email` cannot be updated with this endpoint: a request that
+        includes them fails with 403 and the code `field_not_permitted`. Update
+        these via Rise's web frontend instead.
+      tags: [Employees]
+      security:
+        - BearerAuth: ["employees:write"]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: employee_id
+          in: path
+          required: true
+          description: Identifier of the employee to update.
+          schema: { type: integer, minimum: 1, examples: [1000] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmployeeUpdateRequest'
+      responses:
+        '200':
+          description: The employee after the update.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/EmployeeDocument'
+        '400': { $ref: '#/components/responses/WriteBadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '409': { $ref: '#/components/responses/IdempotencyConflict' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422':
+          description: >
+            The employee was not changed. A value is invalid, or payroll
+            rejected the change. The `errors` array names what was rejected.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /employees/{employee_id}/managers:
+    get:
+      operationId: v1ListEmployeeManagers
+      x-rise-scope: ["employees:read"]
+      summary: List an employee's managers
+      description: >
+        Returns the people one employee currently reports to. Managers are
+        employees, so each record has the same shape and the same
+        permission-dependent attributes as a record from the employees list.
+        Records are ordered by id. Returns 404 for an employee that does not
+        exist or is not visible to the caller. A manager the caller is not
+        permitted to see is left out of the page. A caller can always read their
+        own managers, even without the permissions needed to list other people;
+        each manager record still includes only the fields the caller may view.
+      tags: [Employees]
+      security:
+        - BearerAuth: ["employees:read"]
+      parameters:
+        - name: employee_id
+          in: path
+          required: true
+          description: Identifier of the employee whose managers to list.
+          schema: { type: integer, minimum: 1 }
+        - name: page[number]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: page[size]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: A page of the employee's managers.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/EmployeeList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /onboardings:
+    get:
+      operationId: v1ListOnboardings
+      x-rise-scope: ["employees:read"]
+      summary: List onboardings
+      tags: [Onboarding]
+      description: >
+        Returns a page of onboarding records, one per new hire, ordered by
+        id. Requires permission to manage onboarding.
+      security:
+        - BearerAuth: ["employees:read"]
+      parameters:
+        - name: id
+          in: query
+          required: false
+          description: >
+            Return only these onboardings. Comma-separated, for example
+            `?id=4821,4822`.
+          style: form
+          explode: false
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 100
+            items: { type: integer, minimum: 1 }
+            examples: [[4821, 4822]]
+        - name: status
+          in: query
+          required: false
+          description: >
+            Return only the onboardings at these statuses. Comma-separated,
+            for example `?status=invitation_sent,in_progress`.
+          style: form
+          explode: false
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 7
+            uniqueItems: true
+            items:
+              type: string
+              enum:
+                - not_yet_invited
+                - invitation_sent
+                - in_progress
+                - new_hire_completed
+                - hr_approved
+                - onboarded
+                - cancelled
+        - name: name_search
+          in: query
+          required: false
+          description: Match against the new hire's first, last and common name.
+          schema: { type: string, minLength: 1, maxLength: 100, pattern: '^[^,]+$', examples: ['Aaronson'] }
+        - name: smart_search
+          in: query
+          required: false
+          description: >
+            Match against the new hire's names, their current position title
+            and their department names.
+          schema: { type: string, minLength: 1, maxLength: 100, pattern: '^[^,]+$', examples: ['Engineering'] }
+        - name: start_date_from
+          in: query
+          required: false
+          description: Return only new hires starting on or after this date.
+          schema: { type: string, format: date, examples: ['2026-10-01'] }
+        - name: start_date_to
+          in: query
+          required: false
+          description: Return only new hires starting on or before this date.
+          schema: { type: string, format: date, examples: ['2026-10-31'] }
+        - name: page[number]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: page[size]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: A page of onboardings.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/OnboardingList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+    post:
+      operationId: v1CreateOnboarding
+      x-rise-scope: ["employees:write"]
+      summary: Start onboarding a new hire
+      description: >
+        Creates an employee for a new hire, in the `in_onboarding` stage,
+        together with an onboarding record that tracks their setup before their
+        first day, and returns the onboarding. Everything in the request is
+        created together or not at all.
+
+
+        Through onboarding, new hires can enter their own details and access the
+        platform before their first day. To create an employee without these
+        extra features, use `POST /employees`.
+
+
+        An employee code already in use in your organization fails with 422 and
+        the code `duplicate_employee_code`, and the error names a code that is
+        free. A `home_email`, or a `work_email` when `preferred_email_type` is
+        `work_email`, that already belongs to a user fails with 422, and the
+        error names the field. Requires permission to manage onboarding, and an
+        organization with the onboarding feature.
+      tags: [Onboarding]
+      security:
+        - BearerAuth: ["employees:write"]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OnboardingCreateRequest'
+      responses:
+        '201':
+          description: The onboarding that was created.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/OnboardingDocument'
+        '400': { $ref: '#/components/responses/WriteBadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '409': { $ref: '#/components/responses/IdempotencyConflict' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /employees/{employee_id}/journey_events:
+    get:
+      operationId: v1ListEmployeeJourneyEvents
+      x-rise-scope: ["employees:read"]
+      summary: List an employee's journey events
+      description: >
+        Returns one employee's employment history (hire, status, position,
+        compensation and manager changes), newest effective date first.
+        `event_data` holds what an event changed and `previous_event_data` the
+        values before it; the keys present depend on `event_name`. Events the
+        caller may not see are left out without an error, so a page can be
+        empty. Returns 404 for an unknown or invisible employee.
+      tags: [Journey events]
+      security:
+        - BearerAuth: ["employees:read"]
+      parameters:
+        - name: employee_id
+          in: path
+          required: true
+          description: Identifier of the employee whose journey events are listed.
+          schema: { type: integer, minimum: 1 }
+        - name: page[number]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: page[size]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: A page of the employee's journey events.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/JourneyEventList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+    post:
+      operationId: v1CreateEmployeeJourneyEvent
+      x-rise-scope: ["employees:write"]
+      summary: Record a journey event for an employee
+      description: >
+        Records one dated change to the employee's positions or managers and
+        returns the journey event it created. `command` selects the change:
+        `change_employment_position` sets the employee's positions,
+        `change_employee_managers` sets their managers, and `promote_employee`
+        sets the positions and, optionally, the managers as a single event. A
+        `change_employee_managers` replaces the managers that an earlier hire,
+        manager change or promotion set on the same date. Compensation is not
+        changed. The request fails with 422 for an employee whose onboarding is
+        in progress or cancelled. To undo a journey event, use `POST
+        /journey_events/{journey_event_id}/reversal`.
+      tags: [Journey events]
+      security:
+        - BearerAuth: ["employees:write"]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: employee_id
+          in: path
+          required: true
+          description: Identifier of the employee the event is recorded for.
+          schema: { type: integer, minimum: 1 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/JourneyEventPositionChangeRequest'
+                - $ref: '#/components/schemas/JourneyEventManagersChangeRequest'
+                - $ref: '#/components/schemas/JourneyEventPromotionRequest'
+              discriminator:
+                propertyName: command
+                mapping:
+                  change_employment_position: '#/components/schemas/JourneyEventPositionChangeRequest'
+                  change_employee_managers: '#/components/schemas/JourneyEventManagersChangeRequest'
+                  promote_employee: '#/components/schemas/JourneyEventPromotionRequest'
+      responses:
+        '201':
+          description: The journey event that was recorded.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/JourneyEventDocument'
+        '204':
+          description: >
+            Nothing new was recorded, and there is no response body. A
+            `change_employee_managers` with an empty `manager_ids` first undoes
+            the managers already set on `effective_date`, including by a
+            promotion or hire. If the employee is then left with no managers on
+            that date, nothing new is recorded and this status is returned.
+        '400': { $ref: '#/components/responses/WriteBadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '409':
+          description: >
+            Code `effective_date_overlap`: another change already sets the
+            employee's positions or managers on `effective_date`, and this
+            command cannot replace it. Otherwise, the `Idempotency-Key` sent
+            with this request was already used with a different payload.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /journey_events/{journey_event_id}/reversal:
+    post:
+      operationId: v1ReverseJourneyEvent
+      x-rise-scope: ["employees:write"]
+      summary: Reverse a journey event
+      description: >
+        Undoes one journey event by recording a reversal against it, and returns
+        that reversal. The employee's positions or managers go back to what they
+        would have been had the event never been recorded. Position changes,
+        manager changes and promotions can be reversed, unless they changed
+        compensation. Returns 404 for an event that is unknown or that the
+        caller may not see.
+      tags: [Journey events]
+      security:
+        - BearerAuth: ["employees:write"]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: journey_event_id
+          in: path
+          required: true
+          description: Identifier of the journey event to reverse.
+          schema: { type: integer, minimum: 1 }
+      requestBody:
+        required: false
+        description: The body may be omitted. If sent, it is an empty JSON object.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JourneyEventReversalRequest'
+      responses:
+        '201':
+          description: The reversal that was recorded.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/JourneyEventReversalDocument'
+        '400': { $ref: '#/components/responses/WriteBadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '409':
+          description: >
+            Code `already_reversed`: the event has already been reversed.
+            Otherwise, the `Idempotency-Key` sent with this request was already
+            used with a different payload.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422':
+          description: >
+            Code `not_reversible`: the event is not a position change, a manager
+            change or a promotion, or it changed compensation. Code
+            `payroll_rejected`: payroll rejected the change, and nothing was
+            reversed. Code `validation_failed`: the employee's onboarding is in
+            progress or cancelled.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /onboardings/{onboarding_id}:
+    get:
+      operationId: v1GetOnboarding
+      x-rise-scope: ["employees:read"]
+      summary: Get an onboarding
+      tags: [Onboarding]
+      description: >
+        Returns one onboarding record, in the same shape as records from the
+        list. Returns 404 for an onboarding that does not exist or is not
+        visible to the caller. Requires permission to manage onboarding.
+      security:
+        - BearerAuth: ["employees:read"]
+      parameters:
+        - name: onboarding_id
+          in: path
+          required: true
+          description: Identifier of the onboarding.
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: The onboarding.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/OnboardingDocument'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /onboardings/{onboarding_id}/progress:
+    get:
+      operationId: v1GetOnboardingProgress
+      x-rise-scope: ["employees:read"]
+      summary: Get an onboarding's progress
+      tags: [Onboarding]
+      description: >
+        Returns whether one onboarding is ready to approve, and which required
+        fields still stand in the way, section by section. Returns 404 for an
+        onboarding that does not exist or is not visible to the caller. Requires
+        permission to manage onboarding.
+      security:
+        - BearerAuth: ["employees:read"]
+      parameters:
+        - name: onboarding_id
+          in: path
+          required: true
+          description: Identifier of the onboarding.
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: The onboarding's progress.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/OnboardingProgressDocument'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+
+  /employees/{employee_id}/departments:
+    get:
+      operationId: v1ListEmployeeDepartments
+      x-rise-scope: ["employees:read"]
+      summary: List an employee's departments
+      description: >
+        Returns the departments one employee belongs to, as a member or as a
+        lead. Records are ordered by id. Reading another employee's departments
+        takes the departments permission, or either of the time-off permissions
+        to access time-off reports or to manage time-off policies and reviewers.
+        That check runs first, so a caller with none of them gets 403 for every
+        other employee. With one, the response is 404 for an employee that does
+        not exist or is not visible to the caller. A caller can always list
+        their own departments, with or without those permissions.
+      tags: [Employees]
+      security:
+        - BearerAuth: ["employees:read"]
+      parameters:
+        - name: employee_id
+          in: path
+          required: true
+          description: Identifier of the employee whose departments are listed.
+          schema: { type: integer, minimum: 1 }
+        - name: page[number]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: page[size]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: A page of the employee's departments.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/DepartmentList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+  /employees/{employee_id}/teams:
+    get:
+      operationId: v1ListEmployeeTeams
+      x-rise-scope: ["employees:read"]
+      summary: List an employee's teams
+      description: >
+        Returns the teams one employee belongs to, as a member or as a lead.
+        Records are ordered by id. Reading another employee's teams takes the
+        teams permission, or either of the time-off permissions to access
+        time-off reports or to manage time-off policies and reviewers. That
+        check runs first, so a caller with none of them gets 403 for every other
+        employee. With one, the response is 404 for an employee that does not
+        exist or is not visible to the caller. A caller can always list their
+        own teams, with or without those permissions. A caller who is still
+        onboarding sees only the teams they belong to themselves.
+      tags: [Employees]
+      security:
+        - BearerAuth: ["employees:read"]
+      parameters:
+        - name: employee_id
+          in: path
+          required: true
+          description: Identifier of the employee whose teams are listed.
+          schema: { type: integer, minimum: 1 }
+        - name: is_lead
+          in: query
+          required: false
+          description: >
+            Return only the teams the employee leads. The only accepted value
+            is true; omit the parameter to return every team they belong to.
+          schema:
+            type: boolean
+            enum: [true]
+        - name: page[number]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: page[size]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: A page of the employee's teams.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/TeamList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /employee_codes/next:
+    get:
+      operationId: v1GetNextEmployeeCode
+      x-rise-scope: ["employees:read"]
+      summary: Suggest the next employee code
+      tags: [Employees]
+      description: >
+        Returns an employee code to suggest for the next new hire in the
+        organization, for pre-filling a form. The suggestion is never a code
+        another employee already has, but not every numbering scheme is handled.
+
+
+        To build it, Rise takes the most recently added employee's code and
+        either appends a digit to it ("A" -> "A1") or
+        increments a code that already ends with a number ("A1" -> "A2"). If the
+        result already belongs to an employee, it keeps increasing the number at
+        the end until it finds a code that isn't taken. Codes that belong to
+        cancelled onboardings are not counted as taken. An organization with no
+        employee codes yet gets the code `"1"`.
+
+
+        The suggested code is not reserved: two requests made before either new
+        hire is saved receive the same value.
+      security:
+        - BearerAuth: ["employees:read"]
+      responses:
+        '200':
+          description: The suggested code.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/NextEmployeeCodeDocument'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /teams:
+    get:
+      operationId: v1ListTeams
+      x-rise-scope: ["organization:read"]
+      summary: List teams
+      description: >
+        Returns a page of the teams in your organization, ordered by id. For the
+        teams one employee belongs to, use `GET /employees/{employee_id}/teams`.
+        Requires permission to view teams, or either of the time-off permissions
+        to access time-off reports or to manage time-off policies and reviewers;
+        a caller with none of them gets 403. A caller who is still onboarding
+        sees only the teams they belong to.
+      tags: [Organization]
+      security:
+        - BearerAuth: ["organization:read"]
+      parameters:
+        - name: page[number]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: page[size]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: A page of teams.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/TeamList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /departments:
+    get:
+      operationId: v1ListDepartments
+      x-rise-scope: ["organization:read"]
+      summary: List departments
+      description: >
+        Returns a page of the departments in your organization, ordered by id.
+        The order cannot be changed. For the departments one employee belongs
+        to, use `GET /employees/{employee_id}/departments`.
+      tags: [Organization]
+      security:
+        - BearerAuth: ["organization:read"]
+      parameters:
+        - name: page[number]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: page[size]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: A page of departments.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/DepartmentList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /organization_positions:
+    get:
+      operationId: v1ListOrganizationPositions
+      x-rise-scope: ["organization:read"]
+      summary: List organization positions
+      description: >
+        Returns the positions defined in the organization: the catalogue of job
+        titles it has created. For the positions an employee holds, use `GET
+        /employees/{employee_id}/employment_positions`.
+      tags: [Organization]
+      security:
+        - BearerAuth: ["organization:read"]
+      parameters:
+        - name: sort
+          in: query
+          required: false
+          description: >
+            Orders the page by position name, ignoring case. Prefix with `-`
+            for descending order. Records with the same name are ordered by
+            `id`, so paging through the collection is stable.
+          schema:
+            type: string
+            enum: [position_name, -position_name]
+        - name: page[number]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: page[size]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: A page of organization positions.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/OrganizationPositionList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /payroll_source_organizations:
+    get:
+      operationId: v1ListPayrollSourceOrganizations
+      x-rise-scope: ["organization:read"]
+      summary: List payroll source organizations
+      description: >
+        Returns the payroll organizations the organization is connected to,
+        one record per connection, ordered by `id`. Each record's
+        `payroll_organization_id` is the value `POST /employees` accepts as
+        `payroll_organization_id` to enrol a new employee in that payroll
+        organization.
+      tags: [Organization]
+      security:
+        - BearerAuth: ["organization:read"]
+      parameters:
+        - name: page[number]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: page[size]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: A page of payroll source organizations.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/PayrollSourceOrganizationList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /employees/{employee_id}/onboarding:
+    get:
+      operationId: v1GetEmployeeOnboarding
+      x-rise-scope: ["employees:read"]
+      summary: Get an employee's onboarding
+      description: >
+        Returns the onboarding record for one employee: how far their new-hire
+        setup has progressed and the details read from their employee record. An
+        employee has at most one onboarding, so `data` is a single record, and
+        it is null for an employee who was never onboarded. Returns 404 for an
+        employee that does not exist or is not visible to the caller. Requires
+        permission to manage onboarding.
+      tags: [Onboarding]
+      security:
+        - BearerAuth: ["employees:read"]
+      parameters:
+        - name: employee_id
+          in: path
+          required: true
+          description: Identifier of the employee whose onboarding to return.
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: The employee's onboarding, or null when they have none.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/EmployeeOnboardingDocument'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /employees/{employee_id}/compliance_record:
+    get:
+      operationId: v1GetEmployeeComplianceRecord
+      x-rise-scope: ["employee_compliance:read"]
+      summary: Get an employee's compliance record
+      description: >
+        Returns the compliance record for one employee: their government
+        identifier (a Canadian SIN or a US SSN) and, for employees working in
+        the United States, their FLSA exemption and EEO demographics. An
+        employee has at most one compliance record, so `data` is a single
+        record, and it is null for an employee who has none.
+
+
+        One permission covers the whole record. A caller who may view an
+        employee's government identifier sees every field on it, and any other
+        caller is answered 403. The permission is granted separately for the
+        caller's own record, their direct reports' records, and everyone
+        else's. Reading another employee's record also needs permission to
+        view the people list and employee profiles. Without both, any employee
+        other than the caller answers 404, the same as an employee that does
+        not exist.
+      tags: [Employees]
+      security:
+        - BearerAuth: ["employee_compliance:read"]
+      parameters:
+        - name: employee_id
+          in: path
+          required: true
+          description: Identifier of the employee whose compliance record is returned.
+          schema: { type: integer }
+      responses:
+        '200':
+          description: The employee's compliance record, or null when they have none.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/EmployeeComplianceRecordDocument'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /employees/{employee_id}/emergency_contacts:
+    get:
+      operationId: v1ListEmployeeEmergencyContacts
+      x-rise-scope: ["employees:read"]
+      summary: List an employee's emergency contacts
+      description: >
+        Returns the people to reach on the employee's behalf in an emergency:
+        each contact's name, how they are related to the employee, and their
+        phone numbers, with an email address and postal address when recorded.
+        Only contacts the caller is permitted to see are returned, so the page
+        may be empty for an employee whose contacts are outside the caller's
+        permissions. Returns 404 for an employee that does not exist or is not
+        visible to the caller.
+      tags: [Emergency contacts]
+      security:
+        - BearerAuth: ["employees:read"]
+      parameters:
+        - name: employee_id
+          in: path
+          required: true
+          description: Identifier of the employee whose emergency contacts are listed.
+          schema: { type: integer, minimum: 1 }
+        - name: page[number]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: page[size]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: A page of the employee's emergency contacts.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/EmergencyContactList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+    post:
+      operationId: v1CreateEmployeeEmergencyContact
+      x-rise-scope: ["employees:write"]
+      summary: Add an emergency contact to an employee
+      description: >
+        Creates one emergency contact for the employee named in the path and
+        returns it. The employee is taken from the path; the body contains only
+        the contact's attributes. `name`, `relationship` and `primary_phone`
+        must be present and not blank; `email`, `secondary_phone` and `address`
+        are optional.
+      tags: [Emergency contacts]
+      security:
+        - BearerAuth: ["employees:write"]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: employee_id
+          in: path
+          required: true
+          description: Identifier of the employee the contact is added to.
+          schema: { type: integer, minimum: 1 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [data]
+              properties:
+                data:
+                  type: object
+                  additionalProperties: false
+                  required: [type, attributes]
+                  properties:
+                    type:
+                      type: string
+                      enum: [emergency_contacts]
+                    attributes:
+                      type: object
+                      additionalProperties: false
+                      required: [name, relationship, primary_phone]
+                      properties:
+                        name:
+                          type: string
+                          maxLength: 255
+                          description: The contact's full name.
+                        relationship:
+                          type: string
+                          maxLength: 255
+                          description: >
+                            How the contact is related to the employee, as free
+                            text (for example `spouse` or `parent`).
+                        primary_phone:
+                          type: string
+                          maxLength: 255
+                          description: The number to call first.
+                        email:
+                          type: [string, 'null']
+                          maxLength: 255
+                          description: The contact's email address.
+                        secondary_phone:
+                          type: [string, 'null']
+                          maxLength: 255
+                          description: An alternative number.
+                        address:
+                          type: [string, 'null']
+                          maxLength: 1000
+                          description: The contact's postal address.
+      responses:
+        '201':
+          description: The emergency contact that was created.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/EmergencyContactDocument'
+        '400': { $ref: '#/components/responses/WriteBadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '409': { $ref: '#/components/responses/IdempotencyConflict' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /employees/{employee_id}/locations:
+    get:
+      operationId: v1ListEmployeeLocations
+      x-rise-scope: ["employees:read"]
+      summary: List an employee's work locations
+      description: >
+        Returns the work locations the employee is assigned to: the office or
+        site each one names, with its address when one is recorded. An employee
+        assigned to no location gets an empty page. Returns 404 for an employee
+        that does not exist or is not visible to the caller.
+      tags: [Employees]
+      security:
+        - BearerAuth: ["employees:read"]
+      parameters:
+        - name: employee_id
+          in: path
+          required: true
+          description: Identifier of the employee whose locations are listed.
+          schema: { type: integer, minimum: 1 }
+        - name: page[number]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: page[size]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: A page of the employee's work locations.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/EmployeeLocationList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /employees/{employee_id}/employment_positions:
+    get:
+      operationId: v1ListEmployeeEmploymentPositions
+      x-rise-scope: ["employees:read"]
+      summary: List an employee's position assignments
+      description: >
+        Returns the positions the employee holds or has held. Each names the
+        role, whether it is their primary position, and whether it is in effect
+        today. For the catalogue of positions the organization has defined, use
+        `GET /organization_positions`. Returns 404 for an employee that does not
+        exist or is not visible to the caller.
+      tags: [Employees]
+      security:
+        - BearerAuth: ["employees:read"]
+      parameters:
+        - name: employee_id
+          in: path
+          required: true
+          description: Identifier of the employee whose positions are listed.
+          schema: { type: integer, minimum: 1 }
+        - name: page[number]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: page[size]
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: A page of the employee's position assignments.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/EmploymentPositionList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /emergency_contacts/{emergency_contact_id}:
+    patch:
+      operationId: v1UpdateEmergencyContact
+      x-rise-scope: ["employees:write"]
+      summary: Update an emergency contact
+      description: >
+        Changes one or more attributes of an existing emergency contact and
+        returns the updated record. Attributes absent from the request are
+        left unchanged. The contact stays attached to the same employee:
+        `employee_id` cannot be changed with this operation.
+      tags: [Emergency contacts]
+      security:
+        - BearerAuth: ["employees:write"]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: emergency_contact_id
+          in: path
+          required: true
+          description: Identifier of the emergency contact to update.
+          schema: { type: integer, minimum: 1 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [data]
+              properties:
+                data:
+                  type: object
+                  additionalProperties: false
+                  required: [type, id, attributes]
+                  properties:
+                    type:
+                      type: string
+                      enum: [emergency_contacts]
+                    id:
+                      type: string
+                      pattern: '^\d+$'
+                      description: Must match `emergency_contact_id` in the path; a mismatch fails with 400 and the code `key_not_included_in_url`.
+                    attributes:
+                      type: object
+                      additionalProperties: false
+                      description: Any subset of the attributes below.
+                      properties:
+                        name:
+                          type: string
+                          maxLength: 255
+                          description: The contact's full name.
+                        email:
+                          type: [string, 'null']
+                          maxLength: 255
+                          description: The contact's email address. Send `null` to clear it.
+                        relationship:
+                          type: string
+                          maxLength: 255
+                          description: >
+                            How the contact is related to the employee, as free
+                            text (for example `spouse` or `parent`).
+                        primary_phone:
+                          type: string
+                          maxLength: 255
+                          description: The number to call first.
+                        secondary_phone:
+                          type: [string, 'null']
+                          maxLength: 255
+                          description: An alternative number. Send `null` to clear it.
+                        address:
+                          type: [string, 'null']
+                          maxLength: 1000
+                          description: The contact's postal address. Send `null` to clear it.
+      responses:
+        '200':
+          description: The updated emergency contact.
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/EmergencyContactDocument'
+        '400': { $ref: '#/components/responses/WriteBadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '409': { $ref: '#/components/responses/IdempotencyConflict' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+    delete:
+      operationId: v1DeleteEmergencyContact
+      x-rise-scope: ["employees:write"]
+      summary: Delete an emergency contact
+      description: >
+        Permanently removes one emergency contact. Returns 404 for an id that
+        does not exist or has already been deleted, so repeating a delete for
+        the same id returns 404 once the contact is gone.
+
+
+        `Idempotency-Key` is not used by this operation: the header is ignored
+        and repeats are never replayed. A second delete of the same id returns
+        404 because the contact is already gone.
+      tags: [Emergency contacts]
+      security:
+        - BearerAuth: ["employees:write"]
+      parameters:
+        - name: emergency_contact_id
+          in: path
+          required: true
+          description: Identifier of the emergency contact to delete.
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '204':
+          description: The emergency contact was deleted. There is no response body.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406': { $ref: '#/components/responses/NotAcceptable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >
+        A key you generate that makes retrying this write safe. Send the same
+        key with a retry and the original response is replayed instead of the
+        write happening twice. Reusing a key with a different payload fails with
+        409. Maximum 256 characters. Optional, but recommended for every write.
+        Omit it and a retry is treated as a new request.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 256
+
+  schemas:
+    Error:
+      type: object
+      description: >
+        The standard error body, sent as application/json. It always has an
+        `errors` array, even when there is only one error.
+      required: [errors]
+      properties:
+        errors:
+          type: array
+          description: Always an array, even for a single error.
+          items:
+            type: object
+            required: [code, detail]
+            properties:
+              code:
+                type: string
+                description: >
+                  Stable machine-readable identifier for the failure, for
+                  example `invalid_params`. Branch on this, not on `detail`.
+              detail:
+                type: string
+                description: >
+                  Human-readable explanation of this particular failure, written
+                  for developers reading logs. Do not show it to end users.
+        request_id:
+          type: string
+          description: >
+            Echoes the `X-Request-Id` of the response when one was assigned.
+
+    ProblemDetails:
+      type: object
+      description: >
+        An RFC 7807 problem document, sent as application/problem+json.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          description: URI reference identifying the problem type.
+        title:
+          type: string
+          description: Short, human-readable summary of the problem type.
+        status:
+          type: integer
+          description: >
+            HTTP status code, repeated here for clients that cannot read it
+            from the response directly.
+        detail:
+          type: string
+          description: Human-readable explanation specific to this occurrence.
+
+    EmployeeAttributes:
+      type: object
+      description: >
+        The attributes of an employee record as it is read back. To create an
+        employee, send `EmployeeCreateAttributes`.
+
+
+        Which attributes a record includes depends on what the caller is
+        permitted to see, and the permission is evaluated per record, so a
+        caller may see more of their own record than of a colleague's in the
+        same response. The attributes listed as required do not depend on
+        permissions, so they are present on every record; each of the rest is
+        present only when the caller may read it for that person.
+      required:
+        - created_at
+        - current_status
+        - employment_stage
+        - is_group_lead
+        - is_manager
+        - payroll_employee_id
+        - payroll_organization_id
+        - primary_department_id
+        - primary_department_name
+        - primary_location_id
+        - primary_location_name
+        - primary_manager_id
+        - primary_position_id
+        - primary_position_name
+        - primary_team_id
+        - primary_team_name
+      properties:
+        first_name:
+          type: [string, 'null']
+          description: The person's first name.
+          examples: ['Ada']
+        middle_name:
+          type: [string, 'null']
+          description: The person's middle name.
+          examples: ['Blake']
+        last_name:
+          type: [string, 'null']
+          description: The person's last name.
+          examples: ['Aaronson']
+        common_name:
+          type: [string, 'null']
+          description: The name the person goes by, when it differs from their first name.
+          examples: ['Addie']
+        employee_code:
+          type: [string, 'null']
+          description: >
+            The identifier your organization uses for this person. It should be
+            unique within your organization, and must be unique within a
+            payroll organization.
+          examples: ['E-001']
+        work_email:
+          type: [string, 'null']
+          description: The person's work email address.
+          examples: ['ada.aaronson@example.com']
+        home_email:
+          type: [string, 'null']
+          description: The person's personal email address.
+          examples: ['ada@example.com']
+        work_phone:
+          type: [string, 'null']
+          description: The person's work phone number.
+          examples: ['604-555-0142']
+        home_phone:
+          type: [string, 'null']
+          description: The person's home phone number.
+          examples: ['604-555-0177']
+        cell_phone:
+          type: [string, 'null']
+          description: The person's mobile phone number.
+          examples: ['604-555-0168']
+        address_line_one:
+          type: [string, 'null']
+          description: First line of the person's home address.
+          examples: ['73 Water St']
+        address_line_two:
+          type: [string, 'null']
+          description: Second line of the person's home address.
+          examples: ['Suite 400']
+        city:
+          type: [string, 'null']
+          description: City of the person's home address.
+          examples: ['Vancouver']
+        postal_code:
+          type: [string, 'null']
+          description: Postal or ZIP code of the person's home address.
+          examples: ['V6A 1B1']
+        region_code:
+          type: [string, 'null']
+          description: >
+            Province or state of the person's home address, as the subdivision part
+            of its ISO 3166-2 code (`BC` for `CA-BC`).
+          examples: ['BC']
+        country_code:
+          type: [string, 'null']
+          description: Country of the person's home address, as an ISO 3166-1 alpha-2 code.
+          examples: ['CA']
+        region_code_of_employment:
+          type: [string, 'null']
+          description: >
+            Province or state the person is employed in, as the subdivision part of
+            its ISO 3166-2 code (`BC` for `CA-BC`).
+          examples: ['BC']
+        country_code_of_employment:
+          type: [string, 'null']
+          description: Country the person is employed in, as an ISO 3166-1 alpha-2 code.
+          examples: ['CA']
+        date_of_birth:
+          type: [string, 'null']
+          format: date
+          description: The person's date of birth.
+        gender:
+          type: [string, 'null']
+          enum: [male, female, non_binary, undisclosed, null]
+          description: The person's gender, as they recorded it.
+        gender_pronoun:
+          type: [string, 'null']
+          description: The pronouns the person uses.
+          examples: ['she/her']
+        marital_status:
+          type: [string, 'null']
+          enum: [single, married, widowed, partnership, divorced, null]
+          description: The person's marital status, as they recorded it.
+        start_date:
+          type: [string, 'null']
+          format: date
+          description: The date the person's employment started.
+        employment_stage:
+          type: string
+          enum: [awaiting_employment_details, employment_pending, employed, not_employed,
+                 in_onboarding, onboarding_cancelled]
+          description: >
+            The stage `not_employed` maps to a current status of `terminated` or `resigned`.
+            `awaiting_employment_details` means the employee has no status now or in the future.
+            `employment_pending` means the employee has no current status, but does have a status in the future.
+            `in_onboarding` and `onboarding_cancelled` map to a current status of the same name.
+            `employed` corresponds to all other statuses.
+
+
+            The employees list never returns `in_onboarding` or `onboarding_cancelled`, but
+            `GET /employees/{employee_id}` can.
+        current_status:
+          type: string
+          enum: [active, pending_active, terminated, resigned, maternity_leave,
+                 paternity_leave, suspended_paid, suspended_unpaid, on_leave_paid,
+                 on_leave_unpaid, in_onboarding, onboarding_cancelled, no_status]
+          description: >
+            The person's current employment status. `no_status` means no status
+            has been recorded for them; it is never absent or null.
+        is_manager:
+          type: boolean
+          description: Whether anyone reports to this person.
+        is_group_lead:
+          type: boolean
+          description: Whether this person leads a team, department or location.
+        is_on_leadership_team:
+          type: [boolean, 'null']
+          description: Whether this person is on the organization's leadership team.
+        pay_rate:
+          type: [string, 'null']
+          description: The person's current pay rate.
+          examples: ['60000.0']
+        compensation_method:
+          type: [string, 'null']
+          enum: [salary, hourly, null]
+          examples: ['salary']
+          description: How the person's pay rate is expressed.
+        payroll_employee_id:
+          type: [string, 'null']
+          description: The person's identifier in the payroll organization they are enrolled in.
+          examples: ['0ba25af3-3da1-4b70-846c-cde63b9e930a']
+        payroll_organization_id:
+          type: [string, 'null']
+          description: >
+            Identifier of the payroll organization this person is enrolled in.
+            It matches `payroll_organization_id` in `GET
+            /payroll_source_organizations`.
+          examples: ['8212f539-508e-45f6-ab3d-ad66dc412c41']
+        primary_team_id:
+          type: [integer, 'null']
+          description: Identifier of the person's primary team.
+          examples: [2001]
+        primary_team_name:
+          type: [string, 'null']
+          description: Name of the person's primary team.
+          examples: ['Platform']
+        primary_department_id:
+          type: [integer, 'null']
+          description: Identifier of the person's primary department.
+          examples: [3001]
+        primary_department_name:
+          type: [string, 'null']
+          description: Name of the person's primary department.
+          examples: ['Engineering']
+        primary_location_id:
+          type: [integer, 'null']
+          description: Identifier of the person's primary location.
+          examples: [4001]
+        primary_location_name:
+          type: [string, 'null']
+          description: Name of the person's primary location.
+          examples: ['Vancouver']
+        primary_manager_id:
+          type: [integer, 'null']
+          description: Identifier of the person's primary manager.
+          examples: [1002]
+        primary_position_id:
+          type: [integer, 'null']
+          description: >
+            Identifier of the person's primary position assignment: the `id` of
+            a record in `GET /employees/{employee_id}/employment_positions`. It
+            is not a position id from `GET /organization_positions`.
+          examples: [5001]
+        primary_position_name:
+          type: [string, 'null']
+          description: Name of the person's primary position.
+          examples: ['Payroll Specialist']
+        created_at:
+          type: string
+          format: date-time
+          description: When this person's record was created.
+    Employee:
+      type: object
+      required: [id, type, attributes]
+      properties:
+        id:
+          type: string
+          examples: ['1000']
+        type:
+          type: string
+          enum: [employees]
+          description: Resource type discriminator.
+        attributes:
+          $ref: '#/components/schemas/EmployeeAttributes'
+
+    EmployeeCreateRequest:
+      type: object
+      description: >
+        The request body for creating an employee. See `Employee`
+        for the returned entity.
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [type, attributes]
+          properties:
+            type:
+              type: string
+              enum: [employees]
+            attributes:
+              $ref: '#/components/schemas/EmployeeCreateAttributes'
+
+    EmployeeCreateAttributes:
+      type: object
+      description: >
+        The attributes accepted when creating an employee. The placement
+        inputs `team_ids`, `location_ids`, `department_ids` and `manager_ids`
+        are lists whose first id becomes the person's primary team, location,
+        department or manager, and `position` is a name. They read back as the
+        `primary_*` attributes of `EmployeeAttributes`. `preferred_email_type`
+        and `government_identifier_number` are accepted but not read back.
+      additionalProperties: false
+      required:
+        - first_name
+        - last_name
+        - employee_code
+        - start_date
+        - country_code_of_employment
+        - region_code_of_employment
+        - preferred_email_type
+      properties:
+        first_name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: The person's first name.
+        middle_name:
+          type: [string, 'null']
+          maxLength: 255
+          description: The person's middle name.
+        last_name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: The person's last name.
+        common_name:
+          type: [string, 'null']
+          maxLength: 255
+          description: The name the person goes by, when it differs from their first name.
+        employee_code:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >
+            The identifier your organization uses for this person. It should be
+            unique within your organization, and must be unique within a
+            payroll organization.
+        start_date:
+          type: string
+          format: date
+          description: The date the person's employment starts. They are hired effective this date.
+        country_code_of_employment:
+          type: string
+          pattern: '^[A-Z]{2}$'
+          description: >
+            Country the person is employed in, as an upper-case ISO 3166-1
+            alpha-2 code. A code that names no country is rejected. Must be `CA`
+            when `payroll_organization_id` is sent.
+          examples: ['CA']
+        region_code_of_employment:
+          type: string
+          pattern: '^[A-Z0-9]{1,3}$'
+          description: >
+            Province or state the person is employed in, as the upper-case
+            subdivision part of its ISO 3166-2 code (`BC` for `CA-BC`). When
+            `country_code_of_employment` is sent, it must be one of that
+            country's subdivisions.
+          examples: ['BC']
+        work_email:
+          type: [string, 'null']
+          maxLength: 255
+          description: The person's work email address.
+        home_email:
+          type: [string, 'null']
+          maxLength: 255
+          description: The person's personal email address.
+        preferred_email_type:
+          type: string
+          enum: [work_email, home_email]
+          description: >
+            Which of the person's email addresses they sign in with. The address
+            it names must also be sent.
+        work_phone:
+          type: [string, 'null']
+          maxLength: 255
+          description: The person's work phone number.
+        home_phone:
+          type: [string, 'null']
+          maxLength: 255
+          description: The person's home phone number.
+        cell_phone:
+          type: [string, 'null']
+          maxLength: 255
+          description: The person's mobile phone number.
+        address_line_one:
+          type: [string, 'null']
+          maxLength: 255
+          description: >
+            First line of the person's home address. For payroll employees,
+            this must be 30 characters or less. Required when `payroll_organization_id` is sent.
+        address_line_two:
+          type: [string, 'null']
+          maxLength: 255
+          description: >
+            Second line of the person's home address. For payroll employees,
+            this must be 30 characters or less.
+        city:
+          type: [string, 'null']
+          maxLength: 255
+          description: City of the person's home address. Required when `payroll_organization_id` is sent.
+        postal_code:
+          type: [string, 'null']
+          maxLength: 255
+          description: >
+            Postal or ZIP code of the person's home address. Required when `payroll_organization_id` is sent.
+        region_code:
+          type: [string, 'null']
+          pattern: '^[A-Z0-9]{1,3}$'
+          description: >
+            Province or state of the person's home address, as the upper-case
+            subdivision part of its ISO 3166-2 code (`MB` for `CA-MB`). When
+            `country_code` is sent, it must be one of that country's subdivisions.
+            Required when `payroll_organization_id` is sent.
+          examples: ['MB']
+        country_code:
+          type: [string, 'null']
+          pattern: '^[A-Z]{2}$'
+          description: >
+            Country of the person's home address, as an upper-case ISO 3166-1
+            alpha-2 code. A code that names no country is rejected. Required,
+            and must be `CA`, when `payroll_organization_id` is sent.
+          examples: ['CA']
+        date_of_birth:
+          type: [string, 'null']
+          format: date
+          description: >
+            The person's date of birth. It must be at least 12 years before
+            today. Required when `payroll_organization_id` is sent.
+        gender:
+          type: [string, 'null']
+          enum: [male, female, non_binary, undisclosed, null]
+          description: The person's gender. Required when `payroll_organization_id` is sent.
+        marital_status:
+          type: [string, 'null']
+          enum: [single, married, widowed, partnership, divorced, null]
+          description: The person's marital status.
+        team_ids:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items: { type: integer }
+          description: >
+            The teams the person belongs to, each one of your organization's. The
+            first becomes their primary team, read back as `primary_team_id`. Omit
+            it, or send an empty list, to assign none.
+          examples: [[2001, 2002]]
+        location_ids:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items: { type: integer }
+          description: >
+            The locations the person works at, each one of your organization's. The
+            first becomes their primary location, read back as `primary_location_id`.
+            Omit it, or send an empty list, to assign none.
+          examples: [[4001]]
+        department_ids:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items: { type: integer }
+          description: >
+            The departments the person belongs to, each one of your organization's.
+            The first becomes their primary department, read back as
+            `primary_department_id`. Required when `payroll_organization_id` is sent.
+          examples: [[3001]]
+        manager_ids:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items: { type: integer }
+          description: >
+            The employees the person reports to from `start_date`, each one of your
+            organization's. The first becomes their primary manager, read back as
+            `primary_manager_id`. Omit it, or send an empty list, to assign none.
+          examples: [[1002]]
+        position:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >
+            The name of one of your organization's positions, matched regardless
+            of case and surrounding spaces, held from `start_date`. Read back as
+            `primary_position_name`.
+          examples: ['Payroll Specialist']
+        payroll_organization_id:
+          type: string
+          format: uuid
+          description: >
+            One of your organization's payroll organizations. When sent, the person
+            is also enrolled in that payroll organization, and several other
+            attributes become required. Read back as `payroll_organization_id`.
+          examples: ['8212f539-508e-45f6-ab3d-ad66dc412c41']
+        government_identifier_number:
+          type: [string, 'null']
+          maxLength: 20
+          description: >
+            The person's government identifier: their Social Insurance Number
+            when employed in Canada. Required when `payroll_organization_id` is
+            sent.
+        compensation_method:
+          type: string
+          enum: [salary, hourly]
+          description: >
+            How the person's pay rate is expressed, from `start_date`. Must be sent
+            with `pay_rate`, and cannot be sent with `payroll_organization_id`.
+        pay_rate:
+          type: number
+          exclusiveMinimum: 0
+          description: >
+            The person's pay rate, from `start_date`. Must be sent with
+            `compensation_method`, and cannot be sent with `payroll_organization_id`.
+          examples: [60000]
+
+    EmployeeUpdateRequest:
+      type: object
+      description: >
+        The request body for updating an employee. See `Employee` for the
+        returned entity.
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [type, id, attributes]
+          properties:
+            type:
+              type: string
+              enum: [employees]
+            id:
+              type: string
+              pattern: '^\d+$'
+              description: Must match `employee_id` in the path; a mismatch fails with 400 and the code `key_not_included_in_url`.
+            attributes:
+              $ref: '#/components/schemas/EmployeeUpdateAttributes'
+
+    EmployeeUpdateAttributes:
+      type: object
+      description: >
+        The attributes that can be changed on an existing employee: any subset
+        of the attributes below.
+      additionalProperties: false
+      properties:
+        first_name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: The person's first name.
+        middle_name:
+          type: [string, 'null']
+          maxLength: 255
+          description: The person's middle name.
+        last_name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: The person's last name.
+        common_name:
+          type: [string, 'null']
+          maxLength: 255
+          description: The name the person goes by, when it differs from their first name.
+        employee_code:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >
+            The identifier your organization uses for this person. It should be
+            unique within your organization, and must be unique within a
+            payroll organization.
+        start_date:
+          type: string
+          format: date
+          description: The date the person's employment starts.
+        country_code_of_employment:
+          type: string
+          pattern: '^[A-Z]{2}$'
+          description: >
+            Country the person is employed in, as an upper-case ISO 3166-1
+            alpha-2 code. A code that names no country is rejected.
+          examples: ['CA']
+        region_code_of_employment:
+          type: string
+          pattern: '^[A-Z0-9]{1,3}$'
+          description: >
+            Province or state the person is employed in, as the upper-case
+            subdivision part of its ISO 3166-2 code (`BC` for `CA-BC`). It must
+            be one of the subdivisions of the person's country of employment:
+            the `country_code_of_employment` sent with it, or the one on file.
+          examples: ['BC']
+        work_email:
+          type: [string, 'null']
+          maxLength: 255
+          description: The person's work email address.
+        home_email:
+          type: [string, 'null']
+          maxLength: 255
+          description: The person's personal email address.
+        work_phone:
+          type: [string, 'null']
+          maxLength: 255
+          description: The person's work phone number.
+        home_phone:
+          type: [string, 'null']
+          maxLength: 255
+          description: The person's home phone number.
+        cell_phone:
+          type: [string, 'null']
+          maxLength: 255
+          description: The person's mobile phone number.
+        address_line_one:
+          type: [string, 'null']
+          maxLength: 255
+          description: >
+            First line of the person's home address. For payroll employees,
+            this must be 30 characters or less.
+        address_line_two:
+          type: [string, 'null']
+          maxLength: 255
+          description: >
+            Second line of the person's home address. For payroll employees,
+            this must be 30 characters or less.
+        city:
+          type: [string, 'null']
+          maxLength: 255
+          description: City of the person's home address.
+        postal_code:
+          type: [string, 'null']
+          maxLength: 255
+          description: Postal or ZIP code of the person's home address.
+        region_code:
+          type: [string, 'null']
+          pattern: '^[A-Z0-9]{1,3}$'
+          description: >
+            Province or state of the person's home address, as the upper-case
+            subdivision part of its ISO 3166-2 code (`MB` for `CA-MB`). It must be
+            one of the subdivisions of the home address's country: the
+            `country_code` sent with it, or the one on file.
+          examples: ['MB']
+        country_code:
+          type: [string, 'null']
+          pattern: '^[A-Z]{2}$'
+          description: >
+            Country of the person's home address, as an upper-case ISO 3166-1
+            alpha-2 code. A code that names no country is rejected.
+          examples: ['CA']
+        date_of_birth:
+          type: [string, 'null']
+          format: date
+          description: The person's date of birth. It must be at least 12 years before today.
+        gender:
+          type: [string, 'null']
+          enum: [male, female, non_binary, undisclosed, null]
+          description: The person's gender.
+        gender_pronoun:
+          type: [string, 'null']
+          maxLength: 255
+          description: The pronouns the person uses.
+          examples: ['she/her']
+        marital_status:
+          type: [string, 'null']
+          enum: [single, married, widowed, partnership, divorced, null]
+          description: The person's marital status.
+        is_on_leadership_team:
+          type: boolean
+          description: Whether this person is on the organization's leadership team.
+        primary_manager_id:
+          type: integer
+          minimum: 1
+          description: >
+            Identifier of the person's primary manager. It must be one of the
+            person's current managers; managers themselves are changed through
+            journey events.
+          examples: [1002]
+        primary_department_id:
+          type: integer
+          minimum: 1
+          description: >
+            Identifier of the person's primary department. It must be one of the
+            departments the person belongs to.
+          examples: [3001]
+        primary_team_id:
+          type: integer
+          minimum: 1
+          description: >
+            Identifier of the person's primary team. It must be one of the teams
+            the person belongs to.
+          examples: [2001]
+        primary_location_id:
+          type: integer
+          minimum: 1
+          description: >
+            Identifier of the person's primary location. It must be one of the
+            locations the person belongs to.
+          examples: [4001]
+        primary_position_id:
+          type: integer
+          minimum: 1
+          description: >
+            Identifier of the person's primary position assignment: the `id` of
+            a record in `GET /employees/{employee_id}/employment_positions`.
+            Position ids from `GET /organization_positions` are not accepted. It
+            must be one of the person's current position assignments; positions
+            themselves are changed through journey events.
+          examples: [5001]
+
+    EmployeeList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Employee'
+        meta:
+          $ref: '#/components/schemas/CollectionMeta'
+
+    EmployeeDocument:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Employee'
+
+    TeamAttributes:
+      type: object
+      description: >
+        A team's attributes do not depend on permissions, so every one listed as
+        required is present on every record.
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: The team's name.
+
+    Team:
+      type: object
+      properties:
+        id:
+          type: string
+          examples: ['1000']
+        type:
+          type: string
+          enum: [teams]
+          description: Resource type discriminator.
+        attributes:
+          $ref: '#/components/schemas/TeamAttributes'
+
+    TeamList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Team'
+        meta:
+          $ref: '#/components/schemas/CollectionMeta'
+
+    DepartmentAttributes:
+      type: object
+      required: [name, payroll_department_code]
+      properties:
+        name:
+          type: string
+          description: The department's name.
+          examples: ['Engineering']
+        payroll_department_code:
+          type: [string, 'null']
+          description: >
+            The code your organization uses for this department in payroll,
+            when one is recorded.
+          examples: ['ENG']
+
+    Department:
+      type: object
+      required: [id, type, attributes]
+      properties:
+        id:
+          type: string
+          description: Identifier of the department. Matches `primary_department_id` on an employee record.
+          examples: ['3001']
+        type:
+          type: string
+          enum: [departments]
+          description: Resource type discriminator.
+        attributes:
+          $ref: '#/components/schemas/DepartmentAttributes'
+
+    DepartmentList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Department'
+        meta:
+          $ref: '#/components/schemas/CollectionMeta'
+
+    JourneyEventData:
+      type: object
+      description: >
+        The values an event set, keyed by what it changed. Which keys are
+        present depends on the event; a key that an event did not touch is
+        absent. In `previous_event_data`, the same keys hold the values that
+        applied before the event.
+      properties:
+        status:
+          type: string
+          description: The employment status set by a hire or status change.
+          examples: ['active']
+        resignation_type:
+          type: [string, 'null']
+          enum: [unspecified, regrettable, not_regrettable, null]
+          description: >
+            Whether losing the employee was regrettable, on a status change to
+            a resignation. Null on every other kind of event.
+        benefits_termination_dates:
+          type: [object, 'null']
+          description: >
+            When benefits coverage ends, on a status change to terminated or
+            resigned. Coverage commonly runs past the last day worked, so these
+            dates are not the event's effective date. Each falls on or after the
+            effective date and no more than 70 days after it.
+          properties:
+            health_dental_hsa_eap:
+              type: [string, 'null']
+              format: date
+              description: Last day of health, dental, HSA and EAP coverage.
+              examples: ['2026-03-31']
+            pooled_and_optional:
+              type: [string, 'null']
+              format: date
+              description: Last day of pooled and optional benefits coverage.
+              examples: ['2026-04-30']
+        position:
+          type: string
+          description: The position title, on a position or job change.
+          examples: ['Staff Engineer']
+        positions:
+          type: array
+          description: Every position held after the change.
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                description: The position title.
+              is_default:
+                type: boolean
+                description: >
+                  Whether this was the employee's primary position: the one
+                  their profile shows and payroll is told about.
+        pay_rate:
+          type: [string, 'null']
+          description: >
+            The pay rate, on a compensation change. Present only when the
+            caller is permitted to view the employee's compensation.
+          examples: ['90000']
+        compensation_method:
+          type: [string, 'null']
+          enum: [salary, hourly, null]
+          description: >
+            How the pay rate is expressed, on a compensation change. Like
+            `pay_rate`, present only when the caller is permitted to view the
+            employee's compensation.
+        has_compensation_update:
+          type: boolean
+          examples: [true]
+          description: >
+            On a hire or promotion, whether the event also changed compensation.
+            Present even when the pay rate itself is withheld.
+        manager_ids:
+          type: array
+          items: { type: integer }
+          description: Identifiers of the employee's managers after a manager change.
+          examples: [[4821, 4822]]
+        department_id:
+          type: [integer, 'null']
+          description: The department a compensation change is attributed to.
+          examples: [312]
+
+    JourneyEventAttributes:
+      type: object
+      required: [event_name, effective_date, event_data, previous_event_data]
+      properties:
+        event_name:
+          type: string
+          enum:
+            - employee_hired
+            - employment_status_change
+            - employment_position_change
+            - compensation_policy_change
+            - employee_managers_change
+            - employee_promotion
+            - employee_job_change
+          description: What kind of change the event records.
+        effective_date:
+          type: string
+          format: date
+          description: The date the change took, or takes, effect.
+        event_data:
+          $ref: '#/components/schemas/JourneyEventData'
+        previous_event_data:
+          $ref: '#/components/schemas/JourneyEventData'
+
+    JourneyEvent:
+      type: object
+      required: [id, type, attributes]
+      properties:
+        id:
+          type: string
+          examples: ['9001']
+        type:
+          type: string
+          enum: [journey_events]
+          description: Resource type discriminator.
+        attributes:
+          $ref: '#/components/schemas/JourneyEventAttributes'
+
+    JourneyEventList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/JourneyEvent'
+        meta:
+          $ref: '#/components/schemas/CollectionMeta'
+
+    JourneyEventDocument:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/JourneyEvent'
+
+    JourneyEventReversalRequest:
+      type: object
+      additionalProperties: false
+      description: An empty object. The path names the event to reverse.
+
+    JourneyEventReversalAttributes:
+      type: object
+      required: [employee_id, journey_event_id, reversed_on]
+      properties:
+        employee_id:
+          type: integer
+          description: The employee whose journey event was reversed.
+        journey_event_id:
+          type: integer
+          description: The journey event that was reversed.
+        reversed_on:
+          type: string
+          format: date
+          description: The date the reversal was recorded.
+
+    JourneyEventReversal:
+      type: object
+      required: [id, type, attributes]
+      properties:
+        id:
+          type: string
+          examples: ['9002']
+        type:
+          type: string
+          enum: [journey_event_reversals]
+          description: Resource type discriminator.
+        attributes:
+          $ref: '#/components/schemas/JourneyEventReversalAttributes'
+
+    JourneyEventReversalDocument:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/JourneyEventReversal'
+
+    JourneyEventEffectiveDate:
+      type: string
+      format: date
+      description: >
+        The date the change takes effect, past or future, between 1900-01-01
+        and 2100-12-31.
+      examples: ['2026-10-01']
+
+    JourneyEventPositionInput:
+      type: object
+      additionalProperties: false
+      required: [name, is_default]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >
+            The title of one of the organization's positions, matching a
+            `position_name` from `GET /organization_positions`. Case and
+            surrounding spaces are ignored.
+          examples: ['Staff Engineer']
+        is_default:
+          type: boolean
+          description: >
+            Whether this is the employee's primary position, the one their
+            profile shows. Exactly one position in a non-empty list is the
+            primary one.
+
+    JourneyEventPositionsInput:
+      type: array
+      maxItems: 20
+      description: >
+        Every position the employee holds from `effective_date`, replacing
+        those before it, each named at most once. An empty list leaves the
+        employee with no position.
+      items:
+        $ref: '#/components/schemas/JourneyEventPositionInput'
+
+    JourneyEventManagerIdsInput:
+      type: array
+      maxItems: 20
+      uniqueItems: true
+      description: >
+        The ids of every manager the employee reports to from
+        `effective_date`, replacing those before it. Each is an employee of
+        the organization, and not the employee themselves. An empty list removes
+        all of their managers.
+      items:
+        type: integer
+        minimum: 1
+      examples: [[4821]]
+
+    JourneyEventPositionChangeRequest:
+      type: object
+      additionalProperties: false
+      required: [command, effective_date, changes]
+      properties:
+        command:
+          type: string
+          enum: [change_employment_position]
+        effective_date:
+          $ref: '#/components/schemas/JourneyEventEffectiveDate'
+        changes:
+          type: object
+          additionalProperties: false
+          required: [positions]
+          properties:
+            positions:
+              $ref: '#/components/schemas/JourneyEventPositionsInput'
+
+    JourneyEventManagersChangeRequest:
+      type: object
+      additionalProperties: false
+      required: [command, effective_date, changes]
+      properties:
+        command:
+          type: string
+          enum: [change_employee_managers]
+        effective_date:
+          $ref: '#/components/schemas/JourneyEventEffectiveDate'
+        changes:
+          type: object
+          additionalProperties: false
+          required: [manager_ids]
+          properties:
+            manager_ids:
+              $ref: '#/components/schemas/JourneyEventManagerIdsInput'
+
+    JourneyEventPromotionRequest:
+      type: object
+      additionalProperties: false
+      required: [command, effective_date, changes]
+      properties:
+        command:
+          type: string
+          enum: [promote_employee]
+        effective_date:
+          $ref: '#/components/schemas/JourneyEventEffectiveDate'
+        changes:
+          type: object
+          additionalProperties: false
+          required: [positions]
+          description: >
+            The positions, and optionally the managers. Managers that are
+            omitted are left as they are.
+          properties:
+            positions:
+              $ref: '#/components/schemas/JourneyEventPositionsInput'
+            manager_ids:
+              $ref: '#/components/schemas/JourneyEventManagerIdsInput'
+
+    OrganizationPositionAttributes:
+      type: object
+      description: >
+        A position's attributes do not depend on permissions, so every one
+        listed as required is present on every record.
+      required:
+        - position_name
+      properties:
+        position_name:
+          type: string
+          description: The name of the position, as defined by the organization.
+
+    OrganizationPosition:
+      type: object
+      properties:
+        id:
+          type: string
+          examples: ['1000']
+        type:
+          type: string
+          enum: [organization_positions]
+          description: Resource type discriminator.
+        attributes:
+          $ref: '#/components/schemas/OrganizationPositionAttributes'
+
+    OrganizationPositionList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrganizationPosition'
+        meta:
+          $ref: '#/components/schemas/CollectionMeta'
+
+    PayrollSourceOrganizationAttributes:
+      type: object
+      description: >
+        These attributes do not depend on permissions, so every one is present
+        on every record.
+      required:
+        - payroll_organization_id
+        - payroll_organization_code
+        - payroll_organization_name
+        - is_active
+      properties:
+        payroll_organization_id:
+          type: string
+          format: uuid
+          description: >
+            The payroll organization's identifier. Send it as
+            `payroll_organization_id` when creating an employee to enrol them
+            in this payroll organization.
+          examples: ['8212f539-508e-45f6-ab3d-ad66dc412c41']
+        payroll_organization_code:
+          type: [string, 'null']
+          description: The payroll organization's code, when one is set.
+        payroll_organization_name:
+          type: [string, 'null']
+          description: >
+            The payroll organization's own name, when one is set. This is not
+            the name of your organization.
+        is_active:
+          type: [boolean, 'null']
+          description: Whether payroll reports this payroll organization as active.
+
+    PayrollSourceOrganization:
+      type: object
+      properties:
+        id:
+          type: string
+          examples: ['1000']
+        type:
+          type: string
+          enum: [payroll_source_organizations]
+          description: Resource type discriminator.
+        attributes:
+          $ref: '#/components/schemas/PayrollSourceOrganizationAttributes'
+
+    PayrollSourceOrganizationList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/PayrollSourceOrganization'
+        meta:
+          $ref: '#/components/schemas/CollectionMeta'
+
+    EmergencyContactAttributes:
+      type: object
+      properties:
+        employee_id:
+          type: integer
+          description: Identifier of the employee this contact belongs to.
+        name:
+          type: string
+          description: The contact's full name.
+        email:
+          type: [string, 'null']
+          description: The contact's email address, when one is recorded.
+        relationship:
+          type: string
+          description: >
+            How the contact is related to the employee, as free text (for
+            example `spouse` or `parent`).
+        primary_phone:
+          type: string
+          description: The number to call first.
+        secondary_phone:
+          type: [string, 'null']
+          description: An alternative number, when one is recorded.
+        address:
+          type: [string, 'null']
+          description: The contact's postal address, when one is recorded.
+
+    EmergencyContact:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [emergency_contacts]
+        attributes:
+          $ref: '#/components/schemas/EmergencyContactAttributes'
+
+    EmergencyContactDocument:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/EmergencyContact'
+
+    EmployeeComplianceRecordAttributes:
+      type: object
+      required:
+        - employee_id
+        - government_identifier_type
+        - government_identifier_number
+        - flsa_exemption
+        - veteran_status
+        - eeo_sex
+        - eeo_ethnicity
+        - eeo_job_category
+      properties:
+        employee_id:
+          type: integer
+          description: Identifier of the employee this record belongs to.
+        government_identifier_type:
+          type: [string, 'null']
+          description: >
+            The kind of government identifier on file. `sin` for employees
+            working in Canada and `ssn` for employees working in the United
+            States. Elsewhere it may hold another value, or null when none is
+            recorded.
+        government_identifier_number:
+          type: [string, 'null']
+          description: >
+            The government identifier, without dashes or spaces. Nine
+            characters for a SIN or an SSN, and at most 20 characters
+            elsewhere. Null when none is recorded.
+        flsa_exemption:
+          type: [string, 'null']
+          enum: [exempt, nonexempt, null]
+          description: >
+            Whether the employee is exempt from FLSA overtime rules. United
+            States only, and null elsewhere or when not recorded.
+        veteran_status:
+          type: [string, 'null']
+          enum:
+            - active_duty_wartime_or_campaign_badge_veteran
+            - armed_forces_service_medal_veteran
+            - disabled_veteran
+            - recently_separated_veteran
+            - unspecified
+            - null
+          description: >
+            The employee's protected veteran status for EEO reporting. United
+            States only, and null elsewhere or when not recorded.
+        eeo_sex:
+          type: [string, 'null']
+          enum: [male, female, undisclosed, null]
+          description: >
+            The employee's sex for EEO reporting. United States only, and null
+            elsewhere or when not recorded.
+        eeo_ethnicity:
+          type: [string, 'null']
+          enum:
+            - american_indian_or_alaska_native
+            - asian
+            - black_or_african_american
+            - hispanic_or_latino
+            - native_hawaiian_or_other_pacific_islander
+            - two_or_more_races
+            - white
+            - null
+          description: >
+            The employee's race or ethnicity for EEO reporting. United States
+            only, and null elsewhere or when not recorded.
+        eeo_job_category:
+          type: [string, 'null']
+          enum:
+            - administrative_support_workers
+            - craft_workers
+            - executive_senior_level_officials_and_managers
+            - first_mid_level_officials_and_managers
+            - laborers_and_helpers
+            - operatives
+            - professionals
+            - sales_workers
+            - service_workers
+            - technicians
+            - null
+          description: >
+            The employee's EEO-1 job category. United States only, and null
+            elsewhere or when not recorded.
+
+    EmployeeComplianceRecord:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [employee_compliance_records]
+          description: Resource type discriminator.
+        attributes:
+          $ref: '#/components/schemas/EmployeeComplianceRecordAttributes'
+
+    EmployeeComplianceRecordDocument:
+      type: object
+      description: >
+        A document containing a single compliance record, or null to represent
+        an employee without one.
+      properties:
+        data:
+          oneOf:
+            - $ref: '#/components/schemas/EmployeeComplianceRecord'
+            - type: 'null'
+
+    EmergencyContactList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/EmergencyContact'
+        meta:
+          $ref: '#/components/schemas/CollectionMeta'
+
+    EmployeeLocationAddress:
+      type: object
+      description: >
+        The location's street address. A location recorded as coordinates only
+        has `gps_only: true` and leaves the street fields null.
+      properties:
+        street_number:
+          type: [string, 'null']
+          description: Building or street number.
+        street_address:
+          type: [string, 'null']
+          description: Street name.
+        apt_number:
+          type: [string, 'null']
+          description: Unit, suite or apartment number.
+        city:
+          type: [string, 'null']
+        province:
+          type: [string, 'null']
+          description: Province, state or region.
+        postal_code:
+          type: [string, 'null']
+        country:
+          type: [string, 'null']
+        latitude:
+          type: [number, 'null']
+          description: Decimal degrees, -90 to 90.
+        longitude:
+          type: [number, 'null']
+          description: Decimal degrees, -180 to 180.
+        gps_only:
+          type: boolean
+          description: >
+            True when the location is recorded as coordinates rather than a
+            street address, in which case the street fields are null.
+
+    EmployeeLocationAttributes:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: The location's name.
+        address:
+          oneOf:
+            - $ref: '#/components/schemas/EmployeeLocationAddress'
+            - type: 'null'
+          description: The location's address, or null when none is recorded.
+
+    EmployeeLocation:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [locations]
+        attributes:
+          $ref: '#/components/schemas/EmployeeLocationAttributes'
+
+    EmployeeLocationList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/EmployeeLocation'
+        meta:
+          $ref: '#/components/schemas/CollectionMeta'
+
+    EmploymentPositionAttributes:
+      type: object
+      required: [position_name, is_primary, is_current, organization_position_id]
+      properties:
+        position_name:
+          type: [string, 'null']
+          description: >
+            The name of the position the employee holds. Null when the position
+            has been removed from the organization's list of positions but the
+            assignment remains. The assignment still counts.
+        is_primary:
+          type: boolean
+          description: >
+            True for the employee's primary position.
+        is_current:
+          type: boolean
+          description: True when the assignment is in effect today.
+        organization_position_id:
+          type: [integer, 'null']
+          description: >
+            The position's id in `GET /organization_positions`. Every employee
+            holding the same position shares this value. To find an employee's
+            primary assignment, match this record's `id` against
+            `primary_position_id` on the employee, or read `is_primary`.
+
+    EmploymentPosition:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [employment_positions]
+        attributes:
+          $ref: '#/components/schemas/EmploymentPositionAttributes'
+
+    EmploymentPositionList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/EmploymentPosition'
+        meta:
+          $ref: '#/components/schemas/CollectionMeta'
+
+    OnboardingAttributes:
+      type: object
+      description: >
+        Every attribute is present on every record. The name, start date,
+        position, photo and department describe the new hire and are read
+        from their employee record.
+      required:
+        - created_at
+        - employee_id
+        - status
+        - first_name
+        - last_name
+        - common_name
+        - start_date
+        - primary_position_name
+        - photo_url
+        - primary_department_id
+        - primary_department_name
+        - language
+      properties:
+        created_at:
+          type: string
+          format: date-time
+          description: When the onboarding was created.
+          examples: ['2026-03-02T17:04:11Z']
+        employee_id:
+          type: integer
+          description: Identifier of the new hire's employee record.
+          examples: [1000]
+        status:
+          type: string
+          enum:
+            - not_yet_invited
+            - invitation_sent
+            - in_progress
+            - new_hire_completed
+            - hr_approved
+            - onboarded
+            - cancelled
+          description: >
+            Where the onboarding is in the process. `not_yet_invited` and
+            `invitation_sent` come before the new hire has opened their
+            onboarding; `in_progress` means they have opened it;
+            `new_hire_completed` means they have finished their part. An
+            onboarding can be approved from any status except `cancelled` and
+            `onboarded`. Approval moves it to `onboarded`, passing through
+            `hr_approved`, which remains only if a step after approval fails.
+            `cancelled` ends the process without hiring.
+        first_name:
+          type: [string, 'null']
+          description: The new hire's first name.
+          examples: ['Ada']
+        last_name:
+          type: [string, 'null']
+          description: The new hire's last name.
+          examples: ['Aaronson']
+        common_name:
+          type: [string, 'null']
+          description: The name the new hire goes by, when it differs from their first name.
+          examples: ['Addie']
+        start_date:
+          type: [string, 'null']
+          format: date
+          description: The new hire's first day of work.
+          examples: ['2026-04-01']
+        primary_position_name:
+          type: [string, 'null']
+          description: >
+            The title of the new hire's primary position in effect today, when
+            one is recorded. Once the onboarding is approved, positions are held
+            from the start date, so a future start date leaves this null until
+            that day.
+          examples: ['Software Developer']
+        photo_url:
+          type: [string, 'null']
+          description: A URL for the new hire's profile photo, when one has been uploaded.
+        primary_department_id:
+          type: [integer, 'null']
+          description: Identifier of the new hire's primary department, when one is assigned.
+          examples: [42]
+        primary_department_name:
+          type: [string, 'null']
+          description: Name of the new hire's primary department, when one is assigned.
+          examples: ['Engineering']
+        language:
+          type: string
+          enum: [en, fr]
+          description: >
+            The language the onboarding invitation was written in.
+          examples: ['en']
+
+    Onboarding:
+      type: object
+      required: [id, type, attributes]
+      properties:
+        id:
+          type: string
+          examples: ['4821']
+        type:
+          type: string
+          enum: [onboardings]
+          description: Resource type discriminator.
+        attributes:
+          $ref: '#/components/schemas/OnboardingAttributes'
+
+    OnboardingList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Onboarding'
+        meta:
+          $ref: '#/components/schemas/CollectionMeta'
+
+    OnboardingDocument:
+      type: object
+      description: A document containing a single onboarding record.
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Onboarding'
+
+
+    EmployeeOnboardingDocument:
+      type: object
+      description: >
+        A document containing a single onboarding record, or null to represent
+        an employee without an onboarding.
+      properties:
+        data:
+          oneOf:
+            - $ref: '#/components/schemas/Onboarding'
+            - type: 'null'
+
+    OnboardingCreateRequest:
+      type: object
+      description: >
+        The request body for starting an onboarding. See `Onboarding` for the
+        returned entity.
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [type, attributes]
+          properties:
+            type:
+              type: string
+              enum: [onboardings]
+            attributes:
+              $ref: '#/components/schemas/OnboardingCreateAttributes'
+
+    OnboardingCreateAttributes:
+      type: object
+      additionalProperties: false
+      required: [employee, language, positions]
+      properties:
+        employee:
+          $ref: '#/components/schemas/OnboardingEmployeeCreateAttributes'
+        custom_field_values:
+          type: array
+          maxItems: 100
+          description: >
+            Values for your organization's custom fields, each matched by the
+            field's name. A boolean field takes `true` or `false`.
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, value]
+            properties:
+              name:
+                type: string
+                minLength: 1
+                maxLength: 255
+                description: The custom field's name.
+              value:
+                type: [string, number, boolean, 'null']
+                maxLength: 500
+                description: The value to record.
+        positions:
+          type: array
+          minItems: 1
+          maxItems: 20
+          uniqueItems: true
+          description: >
+            The positions the new hire will hold, each one of your organization's
+            and each at most once. Exactly one must be marked `is_default`.
+          items:
+            type: object
+            additionalProperties: false
+            required: [id]
+            properties:
+              id:
+                type: integer
+                minimum: 1
+                description: >
+                  Identifier of one of your organization's positions. Position
+                  ids can be looked up with `GET /organization_positions`.
+              is_default:
+                type: boolean
+                description: Whether this is the new hire's primary position.
+        requested_custom_field_ids:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items: { type: integer, minimum: 1 }
+          description: >
+            Your organization's custom fields that the new hire is asked to fill
+            in. The new hire is always also asked to fill in your organization's
+            required self-service custom fields.
+          examples: [[5678]]
+        payroll_organization_id:
+          type: string
+          format: uuid
+          description: >
+            One of your organization's payroll organizations. The new hire is
+            enrolled in it when their onboarding is approved, so `employee` must
+            also include `department_ids`, a `country_code_of_employment` of
+            `CA` and a `region_code_of_employment`.
+          examples: ['8212f539-508e-45f6-ab3d-ad66dc412c41']
+        language:
+          type: string
+          enum: [en, fr]
+          description: The language of the new hire's invitation.
+        invite_email:
+          $ref: '#/components/schemas/OnboardingInviteEmail'
+        ats_application_id:
+          type: integer
+          minimum: 1
+          maximum: 9223372036854775807
+          description: >
+            Identifier of the recruiting application the new hire was hired
+            from. Once that application's offer letter is signed, it is filed
+            in the new hire's documents.
+
+    OnboardingEmployeeCreateAttributes:
+      type: object
+      description: >
+        The new hire's profile. `team_ids`, `department_ids` and `manager_ids`
+        are lists whose first id becomes the new hire's primary team,
+        department or manager. The new hire enters their own personal details
+        during onboarding.
+      additionalProperties: false
+      required: [first_name, last_name, home_email, employee_code, start_date, country_code_of_employment]
+      properties:
+        first_name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: The new hire's first name.
+        middle_name:
+          type: [string, 'null']
+          maxLength: 255
+          description: The new hire's middle name.
+        last_name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: The new hire's last name.
+        common_name:
+          type: [string, 'null']
+          maxLength: 255
+          description: The name the new hire goes by, when it differs from their first name.
+        employee_code:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: The identifier your organization uses for this person. Must not be in use.
+        start_date:
+          type: string
+          format: date
+          description: The new hire's first day of work.
+        country_code_of_employment:
+          type: string
+          pattern: '^[A-Z]{2}$'
+          description: >
+            Country the new hire will be employed in, as an upper-case ISO
+            3166-1 alpha-2 code. A code that names no country is rejected.
+          examples: ['CA']
+        region_code_of_employment:
+          type: [string, 'null']
+          pattern: '^[A-Z0-9]{1,3}$'
+          description: >
+            Province or state the new hire will be employed in, as the upper-case
+            subdivision part of its ISO 3166-2 code (`BC` for `CA-BC`). Required
+            when `country_code_of_employment` has subdivisions, and must be one
+            of them.
+          examples: ['BC']
+        work_email:
+          type: [string, 'null']
+          maxLength: 255
+          description: The new hire's work email address.
+        home_email:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: The new hire's personal email address. Their invitation is sent to it.
+        preferred_email_type:
+          type: string
+          enum: [work_email, home_email]
+          default: home_email
+          description: >
+            Which of the new hire's email addresses they sign in with once
+            onboarded; leave it out for `home_email`. `work_email` requires
+            `work_email` to be sent.
+        work_phone:
+          type: [string, 'null']
+          maxLength: 255
+          description: The new hire's work phone number.
+        team_ids:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items: { type: integer, minimum: 1 }
+          description: The teams the new hire will belong to, each one of your organization's.
+          examples: [[2001, 2002]]
+        department_ids:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items: { type: integer, minimum: 1 }
+          description: The departments the new hire will belong to, each one of your organization's.
+          examples: [[3001]]
+        manager_ids:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items: { type: integer, minimum: 1 }
+          description: The employees the new hire will report to, each one of your organization's.
+          examples: [[1002]]
+
+    OnboardingInviteEmail:
+      type: object
+      description: >
+        The invitation email for the new hire. Each field that is omitted or
+        null is filled with the default invitation in `language`. The text may
+        contain `[[company_name]]`, `[[new_hire_name]]` and `[[new_hire_date]]`,
+        which are replaced with the organization's name, the new hire's name and
+        their first day when the invitation is sent.
+      additionalProperties: false
+      properties:
+        subject:
+          type: [string, 'null']
+          maxLength: 255
+          description: The email's subject line.
+          examples: ["Welcome to [[company_name]]! Let's get you started."]
+        preview_text:
+          type: [string, 'null']
+          maxLength: 255
+          description: The text an email client shows beside the subject.
+        body_text:
+          type: [string, 'null']
+          maxLength: 20000
+          description: The email's body, as HTML.
+
+    OnboardingProgressAttributes:
+      type: object
+      description: >
+        Whether an onboarding can be approved, and what is still missing. Both
+        attributes are present on every record.
+      required: [approvable, sections]
+      properties:
+        approvable:
+          type: boolean
+          description: >
+            True when every required field has a value and the onboarding is
+            neither cancelled nor already onboarded. An onboarding whose
+            sections are all complete can still be false here because of its
+            status.
+        sections:
+          type: array
+          description: >
+            One entry per section of the onboarding, always all six and always
+            in this order: personal, contact, bank, custom_fields, admin, other.
+          items:
+            $ref: '#/components/schemas/OnboardingProgressSection'
+
+    OnboardingProgressSection:
+      type: object
+      required: [name, required_fields_completed, missing_fields]
+      properties:
+        name:
+          type: string
+          enum: [personal, contact, bank, custom_fields, admin, other]
+          description: The section of the onboarding these fields belong to.
+        required_fields_completed:
+          type: boolean
+          description: True when no required field in this section is missing.
+        missing_fields:
+          type: array
+          description: >
+            The required fields in this section that still have no value. Empty
+            when the section is complete.
+
+
+            Standard fields use the name they have on the employee record, for
+            example `date_of_birth` or `postal_code`. Three are not attributes
+            of the public employee record: `preferred_email` means the email of
+            the employee's preferred type (`work_email` or `home_email`) is not
+            set, `government_identifier_number` is the employee's SIN or
+            equivalent, which the public API does not expose, and `bank_account`
+            means the onboarding has no bank account. Custom fields, in the
+            `custom_fields` section, are named by their label.
+          items:
+            type: string
+          examples: [['date_of_birth']]
+
+    OnboardingProgress:
+      type: object
+      required: [id, type, attributes]
+      properties:
+        id:
+          type: string
+          description: The onboarding's identifier, the same id as in the onboardings list.
+          examples: ['4821']
+        type:
+          type: string
+          enum: [onboarding_progress]
+          description: Resource type discriminator.
+        attributes:
+          $ref: '#/components/schemas/OnboardingProgressAttributes'
+
+    OnboardingProgressDocument:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/OnboardingProgress'
+
+    NextEmployeeCodeAttributes:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          description: >
+            The suggested employee code. Always a string, including when the
+            code is made only of digits.
+          examples: ['EMP-42']
+
+    NextEmployeeCode:
+      type: object
+      required: [id, type, attributes]
+      properties:
+        id:
+          type: string
+          enum: [next]
+          description: >
+            Always `next`. A suggestion is not stored, so it has no identifier
+            of its own.
+        type:
+          type: string
+          enum: [employee_codes]
+          description: Resource type discriminator.
+        attributes:
+          $ref: '#/components/schemas/NextEmployeeCodeAttributes'
+
+    NextEmployeeCodeDocument:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/NextEmployeeCode'
+
+    CollectionMeta:
+      type: object
+      description: Metadata returned alongside every paginated list.
+      properties:
+        count:
+          type: integer
+          description: >
+            Total number of records matching the request across all pages, not
+            the number returned in this page.
+
+  headers:
+    X-Request-Id:
+      description: >
+        Correlation id assigned to this request. Present on every response.
+        Quote it when reporting a problem.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: >
+        The request did not match this contract: an unrecognized query
+        parameter, an invalid value for a declared one, a malformed format, or
+        a page beyond the addressable range.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    UnprocessableEntity:
+      description: >
+        The request was well-formed but could not be applied. The `errors`
+        array names what was rejected.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    InternalServerError:
+      description: >
+        An unexpected error. No detail about the cause is returned. Retry, and
+        quote the `X-Request-Id` if the problem persists.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    WriteBadRequest:
+      description: >
+        The request body or query did not match this contract, or the
+        `Idempotency-Key` exceeded 256 characters.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+    UnsupportedMediaType:
+      description: >
+        The request body was not sent with a `Content-Type` of
+        application/json.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    Unauthorized:
+      description: >
+        The access token is missing, malformed, expired, revoked, or does not
+        identify an organization.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+    Forbidden:
+      description: >
+        The caller is not permitted to perform this operation, or not
+        permitted to act on the particular record addressed.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+    NotFound:
+      description: >
+        The operation is not available to this caller, or the record addressed
+        does not exist.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+    NotAcceptable:
+      description: >
+        The Accept header allows no media type this API can return. Responses are
+        application/vnd.api+json; an Accept of application/json,
+        application/vnd.api+json, application/* or */* is accepted, with or
+        without media type parameters.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+    IdempotencyConflict:
+      description: >
+        The `Idempotency-Key` sent with this request was already used with a
+        different payload. Use a new key, or resend the original payload.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+    TooManyRequests:
+      description: >
+        Rate limit exceeded. Wait for the interval given in `Retry-After`
+        before retrying.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+  securitySchemes:
+    BearerAuth:
+      type: oauth2
+      description: OAuth 2.0 access token (client credentials).
+      flows:
+        clientCredentials:
+          tokenUrl: https://api.risepeople.com/v1/oauth/token
+          scopes:
+            employees:read: Read the employee directory
+            organization:read: Read the organization structure (teams, departments, positions)
+            employee_compliance:read: Read employee government identifiers and US EEO/FLSA data
+            employees:write: Create and update employee records

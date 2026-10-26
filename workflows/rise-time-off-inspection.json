@@ -1,0 +1,259 @@
+{
+  "name": "Rise HR - collect readable time off requests - inspection",
+  "nodes": [
+    {
+      "id": "manual",
+      "name": "Run read-only inspection",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "initialize",
+      "name": "Initialize collection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "function initialize() {\n  return {\n    stage: 'employees', page: 1, pageSize: 100, expectedCount: null,\n    employeeIds: [], employeeIndex: 0, currentRequestIds: [],\n    requests: [], rawRequestPages: [], employeeResults: [],\n    startedAt: new Date().toISOString(),\n  };\n}\nreturn [{ json: initialize() }];"
+      }
+    },
+    {
+      "id": "pace",
+      "name": "Pace requests",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        0
+      ],
+      "webhookId": "rise-inspection-wait",
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": 2,
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "prepare",
+      "name": "Prepare next page",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "function prepare(state) {\n  if (!['employees', 'requests'].includes(state.stage)) throw new Error('No page to collect.');\n  if (!Number.isInteger(state.page) || state.page < 1 || state.page > 10000) {\n    throw new Error('Invalid page number or inspection page safety limit exceeded.');\n  }\n  const query = `page%5Bnumber%5D=${state.page}&page%5Bsize%5D=${state.pageSize}`;\n  const resource = state.stage === 'employees' ? 'employees' : 'time_off_requests';\n  const employeeId = state.employeeIds[state.employeeIndex];\n  if (state.stage === 'requests' && !/^\\d+$/.test(employeeId || '')) {\n    throw new Error('Missing numeric employee resource ID.');\n  }\n  return {\n    ...state,\n    requestUrl: `https://api.risepeople.com/v1/${resource}?${query}` +\n      (state.stage === 'requests' ? `&employee_id=${employeeId}` : ''),\n  };\n}\nreturn { json: prepare($json) };"
+      }
+    },
+    {
+      "id": "get",
+      "name": "GET Rise page - select credential",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        0
+      ],
+      "retryOnFail": false,
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.requestUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.api+json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "process",
+      "name": "Validate and collect page",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "function processPage(previous, response) {\n  // No error-body or short-page interpretation can silently turn into a complete scan.\n  const state = JSON.parse(JSON.stringify(previous));\n  const body = response.body;\n  if (response.statusCode !== 200 || !body || !Array.isArray(body.data)) {\n    throw new Error('Expected HTTP 200 with a JSON:API data array; collection is incomplete.');\n  }\n  const count = body.meta?.count;\n  if (!Number.isInteger(count) || count < 0 || body.data.length > state.pageSize) {\n    throw new Error('Missing/invalid meta.count or oversized page; inspect the actual API response.');\n  }\n  if (state.expectedCount !== null && count !== state.expectedCount) {\n    throw new Error('Collection total changed during pagination; rerun the inspection.');\n  }\n  state.expectedCount = count;\n  const seen = state.stage === 'employees' ? state.employeeIds : state.currentRequestIds;\n  const employeeId = state.employeeIds[state.employeeIndex];\n  for (const row of body.data) {\n    if (!row || typeof row.id !== 'string' || !/^\\d+$/.test(row.id)) {\n      throw new Error('Expected a numeric string resource ID.');\n    }\n    if (seen.includes(row.id)) throw new Error('Repeated resource ID across pages; collection is unstable.');\n    if (state.stage === 'requests') {\n      if (row.type !== 'time_off_requests' || String(row.attributes?.employee_id) !== employeeId) {\n        throw new Error('Request identity does not match the employee being collected.');\n      }\n      if (state.requests.some(existing => existing.id === row.id)) {\n        throw new Error('Request ID was returned for more than one employee.');\n      }\n      state.requests.push(row);\n    } else if (row.type !== 'employees') {\n      throw new Error('Expected an employee resource.');\n    }\n    seen.push(row.id);\n  }\n  if (state.stage === 'requests') {\n    state.rawRequestPages.push({\n      employee_id: employeeId, page: state.page,\n      retrieved_at: new Date().toISOString(),\n      request_id: response.headers?.['x-request-id'] ?? response.headers?.['X-Request-Id'] ?? null,\n      body,\n    });\n  }\n  if (seen.length > count || (seen.length < count && body.data.length === 0)) {\n    throw new Error('Page contents disagree with meta.count; collection is incomplete.');\n  }\n  if (seen.length < count) {\n    state.page += 1;\n    return state;\n  }\n  if (state.stage === 'employees') {\n    state.stage = state.employeeIds.length ? 'requests' : 'done';\n  } else {\n    state.employeeResults.push({employee_id: employeeId, request_count: seen.length});\n    state.employeeIndex += 1;\n    if (state.employeeIndex === state.employeeIds.length) state.stage = 'done';\n  }\n  state.page = 1;\n  state.expectedCount = null;\n  state.currentRequestIds = [];\n  delete state.requestUrl;\n  return state;\n}\nreturn { json: processPage($('Prepare next page').item.json, $json) };"
+      }
+    },
+    {
+      "id": "continue",
+      "name": "More pages or employees",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1320,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "not-done",
+              "leftValue": "={{ $json.stage !== 'done' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "summary",
+      "name": "Time off sample output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        120
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "function summarize(state) {\n  if (state.stage !== 'done') throw new Error('Collection has not completed.');\n  const statusCounts = {};\n  const attributeFields = new Set();\n  for (const row of state.requests) {\n    const status = row.attributes?.request_status ?? 'missing';\n    statusCounts[status] = (statusCounts[status] || 0) + 1;\n    for (const field of Object.keys(row.attributes || {})) attributeFields.add(field);\n  }\n  return {\n    collection_scope: 'All readable requests for the visible employee roster; organization coverage is unverified.',\n    started_at: state.startedAt, finished_at: new Date().toISOString(),\n    employee_count: state.employeeIds.length, request_count: state.requests.length,\n    status_counts: statusCounts, observed_attribute_fields: [...attributeFields].sort(),\n    coverage_warnings: [\n      'Directory permissions may return only the caller; verify the employee count against the HR roster.',\n      'Time Off visibility may differ from directory visibility; zero requests does not prove full access.',\n      'Incomplete onboarding employees are excluded by the employee list.',\n      'These reads are not an atomic snapshot; changes during collection can require a rerun.',\n    ],\n    employee_results: state.employeeResults,\n    data: state.requests,\n    raw_request_pages: state.rawRequestPages,\n  };\n}\nreturn { json: summarize($json) };"
+      }
+    }
+  ],
+  "connections": {
+    "Run read-only inspection": {
+      "main": [
+        [
+          {
+            "node": "Initialize collection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Initialize collection": {
+      "main": [
+        [
+          {
+            "node": "Pace requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pace requests": {
+      "main": [
+        [
+          {
+            "node": "Prepare next page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare next page": {
+      "main": [
+        [
+          {
+            "node": "GET Rise page - select credential",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET Rise page - select credential": {
+      "main": [
+        [
+          {
+            "node": "Validate and collect page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate and collect page": {
+      "main": [
+        [
+          {
+            "node": "More pages or employees",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "More pages or employees": {
+      "main": [
+        [
+          {
+            "node": "Pace requests",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Time off sample output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Toronto",
+    "saveManualExecutions": false,
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "none",
+    "saveExecutionProgress": false
+  },
+  "pinData": {},
+  "tags": []
+}

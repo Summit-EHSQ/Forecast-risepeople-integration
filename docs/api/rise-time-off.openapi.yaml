@@ -1,0 +1,2724 @@
+openapi: 3.1.0
+
+info:
+  title: Time Off API
+  version: 1.0.0
+  contact:
+    name: Rise Platform Team
+    email: platform@risepeople.com
+  description: |
+    The Rise Time Off API provides access to employee time-off requests, to a
+    reviewer's approval queue, and to an employee's vacation balances and the
+    policy rules that govern them. Consumers can list requests for an
+    employee, filter them by status and date range, list the approvals waiting
+    on the caller, list the policies an employee is enrolled in, and page
+    through any of them.
+
+    **Authentication:** Endpoints accept either a user JWT (`BearerUserAuth`)
+    or an OAuth 2.0 client-credentials token (`BearerAuth`). Both require the
+    `time_off:read` scope. The client-credentials flow is intended for
+    server-to-server integrations.
+
+    **Pagination:** List endpoints are page-based, via the `page[number]` and
+    `page[size]` query parameters. The total number of records matching the
+    filters — not just the current page — is returned in `meta.count`.
+
+    **Query parameters:** Each operation documents the parameters it accepts.
+    Anything else is rejected with `400` rather than ignored, so a misspelled
+    parameter never silently returns a broader result set than intended.
+
+    **Forward compatibility:** Ignore response fields you do not recognize, and
+    accept enum values not listed here. Fields and values are added over time
+    without a version change; nothing documented is removed or repurposed
+    within a version.
+
+servers:
+  - url: https://api.risepeople.com/v1
+    description: Production
+
+security:
+  - BearerAuth: []
+  - BearerUserAuth: []
+
+tags:
+  - name: Time Off
+    description: Employee time-off requests.
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+paths:
+  /time_off_requests:
+    get:
+      operationId: listEmployeeTimeOffRequests
+      x-rise-scope: ["time_off:read"]
+      summary: List time-off requests
+      description: |
+        Returns the time-off requests the caller may see, oldest first (by
+        record id). Ordering is not caller-controllable in v1.
+
+        Self-scoped by default for user-delegated tokens. An explicit
+        `employee_id` is honoured only within the caller's own access scope —
+        naming an employee outside it returns an empty collection rather than
+        another employee's data. Machine-to-machine tokens must supply
+        `employee_id` explicitly.
+      tags:
+        - Time Off
+      security:
+        - BearerAuth: []
+        - BearerUserAuth: []
+      parameters:
+        - name: employee_id
+          in: query
+          required: false
+          description: >-
+            Employee whose requests to return. Defaults to the caller for
+            user-delegated tokens; required for machine-to-machine tokens.
+          schema:
+            type: integer
+            example: 12345
+        - name: status
+          in: query
+          required: false
+          description: Filter by request status.
+          schema:
+            $ref: '#/components/schemas/TimeOffRequestStatus'
+        - name: start_date
+          in: query
+          required: false
+          description: >-
+            Start of the date window. Combined with `end_date` into an overlap
+            filter — a request is returned when any part of it falls in range.
+          schema:
+            type: string
+            format: date
+            example: '2026-08-01'
+        - name: end_date
+          in: query
+          required: false
+          description: End of the date window.
+          schema:
+            type: string
+            format: date
+            example: '2026-08-31'
+        - name: page[number]
+          in: query
+          required: false
+          description: One-based index of the page to return.
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page[size]
+          in: query
+          required: false
+          description: >-
+            Records per page. Values above the maximum are rejected rather than
+            clamped, so a caller is never silently given a short page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/TimeOffRequestList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '404':
+          description: >-
+            The Time Off API is not available to the caller's organization.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    post:
+      operationId: createEmployeeTimeOffRequest
+      x-rise-scope: ["time_off:write"]
+      summary: Submit a time-off request
+      tags:
+        - Time Off
+      description: |
+        Submits a time-off request and returns what it will cost, day by day.
+
+        **The request is filed for the caller unless `employee_id` names
+        someone else.** The caller is the employee the token names: a
+        user-delegated token names the signed-in employee, and a
+        client-credentials token names the application's configured service
+        user. A token that names no employee at all is refused.
+
+        **Filing for someone else.** Set `employee_id` to the employee the
+        request is for. The caller may name an employee they manage, an
+        employee on a team or in a department they lead, or — if they hold the
+        permission to record time off taken — anyone in their organization.
+        A client-credentials token is judged the same way, by what its service
+        user may do. Any other employee is refused with `403`, whether or not
+        they exist. Every `enrolled_policy_id` must then belong to that
+        employee; naming one of the caller's own is refused with `404`.
+
+        A request filed for someone else **skips review**: it is created
+        `confirmed` and reaches payroll like any approved request, and its
+        balance moves as `debit_timing` says. It has no reviewers, so a
+        `comment` submitted with it is stored but returned by no operation.
+        The response's `employee_id` is the employee it was filed for; the
+        caller is recorded as its creator. Naming the caller in `employee_id`
+        is the same as omitting it.
+
+        **Per-day amounts are computed, not submitted.** Send an enrollment and
+        a date range; the server prices every date the way the dashboard does,
+        honouring the employee's work schedule and the holiday calendar observed
+        at their location. Days that cost nothing are still returned, priced at
+        zero. `start_increment` and `end_increment` set the first and last day
+        and default to a whole day — or, on an enrollment measured in hours, to
+        a whole working day's hours.
+
+        Use the impact preview to see the cost before submitting. It prices the
+        same dates through the same code, and takes no permission, blackout or
+        balance check into account — this operation is the only authority on
+        whether a request is accepted.
+
+        **One enrollment per request in this version.** `components` takes
+        exactly one entry. An absence that should draw on two policies has to
+        be submitted as two requests, one per enrollment, each covering its own
+        dates. A later version is expected to accept several components in one
+        request; nothing about the field's shape changes when it does, so a
+        client that already sends a single-entry array keeps working.
+
+        **`Idempotency-Key` is required by this operation.** The platform treats
+        the header as optional; this operation does not, because a retry it
+        cannot recognise creates a second request. Replaying a key and the `409`
+        on a conflicting payload are handled at the gateway — **this service
+        performs no de-duplication of its own.**
+
+        Once the first request on a key has answered below `500`, a retry with
+        the same body is served that first answer if the gateway could store
+        it, and never reaches this service; if it could not, the retry is
+        refused with `409` (`idempotency-replay-unavailable`), and the request
+        may have been created. A different body on that key is refused with
+        `409` (`idempotency-key-reuse`). **Every answer below `500` is replayed,
+        refusals included** — a `400`, a `404`, or the gateway's own `429` — so
+        after a refusal, correct the request if needed and submit it under a
+        new key. A key is remembered for 24 hours, and is scoped to the OAuth
+        client and the user the token names (for a client-credentials token,
+        its service user) — not to the employee named in `employee_id`, so
+        requests filed for different employees under one token share a key
+        space. Use a fresh UUID per submission, rather than a value derived
+        from the employee and the dates.
+
+        **Protection is best-effort, and covers less than a timeout needs.**
+        A retry — or a different body on the same key — reaches this service
+        again, and creates a second request with a second balance movement,
+        when:
+
+        - **the first request has not answered yet.** Nothing holds a key while
+          its request is in progress, so a client that gives up waiting and
+          retries is not recognised;
+        - **the first answer was `500` or above**, including a gateway timeout.
+          Those are not remembered, and the request may still have been
+          created;
+        - **the gateway's cache is unavailable**, in which case it fails open.
+
+        After a timeout, a `5xx` or an `idempotency-replay-unavailable` `409`,
+        list the employee's requests for those dates before submitting again.
+        There is no way to undo a duplicate through this API in this version.
+
+        **Blackout periods are enforced**, across every component, and cannot
+        be discovered in advance: no operation publishes an organization's
+        blackout windows, and the impact preview deliberately ignores them. A
+        request inside one is refused with `blackout_period`. The one
+        exemption is a caller holding the permission to record time off taken,
+        filing for someone else.
+
+        **What the response status means.** A request filed for the caller is
+        `in_progress` when this returns: reviewers are resolved in the
+        background, and within moments the request becomes `in_review` — or
+        `confirmed`, where the policy resolves to no reviewers. Read the
+        current value from the list operation rather than assuming this one is
+        still accurate. A request filed for someone else is `confirmed`.
+
+        A `201` does not mean the balance was sufficient. Only a payroll
+        enrollment configured to prevent a negative balance refuses on that
+        basis, and only when the projection proves a crossing; every other
+        enrollment may go negative by design. That refusal has the same one
+        exemption as blackouts: a caller holding the permission to record time
+        off taken, filing for someone else, may take the balance below zero.
+        `debit_timing` says when the balance actually moves — `submission`
+        now, or `pay_date` when payroll next runs the covering period.
+
+        A submitted `comment` is stored. Only the request's reviewers read it
+        back, as the latest note on the request, through
+        `listReviewerRequestReviews`.
+      security:
+        - BearerAuth: []
+        - BearerUserAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: >-
+            Client-generated token identifying this submission, at most 256
+            characters. Replay and conflict are handled at the gateway, which
+            scopes the key to the OAuth client and the token's user, if it
+            names one, remembers it for 24 hours once the request has answered
+            below `500`, and fails open when its cache is unavailable. Use a
+            fresh unguessable value per submission. This service stores
+            nothing.
+          schema:
+            type: string
+            maxLength: 256
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTimeOffRequest'
+      responses:
+        '201':
+          description: Created
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedTimeOffRequestDocument'
+        '400':
+          description: >-
+            The body was refused. `code` names the reason: `invalid_params` for
+            a malformed or unsupported body, or a value the enrollment does not
+            permit, `request_not_contiguous` where the
+            components leave a gap, `blackout_period` where the dates fall in a
+            blackout window, `negative_balance_blocked` where the request would
+            drive a protected payroll balance below zero, or `invalid_params`
+            for a missing `Idempotency-Key`. A key longer than 256 characters
+            is refused by the gateway before this service sees the request, as
+            `application/problem+json` with type `idempotency-key-too-long`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: >-
+            The token names no employee, so there is nobody to file the request
+            as; `employee_id` names an employee the caller may not file for,
+            which is answered the same whether or not that employee exists; or
+            the token's granted scope does not cover this operation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: >-
+            The enrolled policy is not one the caller can see, or does not
+            belong to the employee the request is filed for, or the Time Off
+            API is not available to their organization. These are deliberately
+            indistinguishable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          description: >-
+            Gateway-reported; this service does not produce this status.
+            Either the same `Idempotency-Key` was already used with a
+            different payload (`idempotency-key-reuse`), or its first request
+            completed with a response the gateway cannot replay
+            (`idempotency-replay-unavailable`), in which case the request may
+            have been created. Do not retry with that key; after the second,
+            list the employee's requests before submitting again.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+        '411':
+          $ref: '#/components/responses/IdempotencyLengthRequired'
+        '413':
+          $ref: '#/components/responses/IdempotencyPayloadTooLarge'
+        '415':
+          description: The body was not sent as `application/json`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          description: >-
+            A service the submission depends on did not respond, or the
+            submission could not be queued. Nothing was created; retry after the
+            interval in `Retry-After`.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '504':
+          description: >-
+            A service the submission depends on did not respond in time —
+            pricing the dates needs the employee's work schedule and holiday
+            calendar, and filing for someone else needs to establish whether
+            the caller manages or leads them. Nothing was created; retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /request_reviews:
+    get:
+      operationId: listReviewerRequestReviews
+      x-rise-scope: ["time_off:read"]
+      summary: List the reviewer's pending approvals
+      tags:
+        - Time Off
+      description: |
+        Returns the time-off approvals waiting on the caller, oldest first (by
+        record id). This is the caller's own queue: a review appears here only
+        while it is awaiting their decision, and the caller's own requests are
+        never included, since nobody reviews their own time off.
+
+        The queue is deliberately flat. Each row carries enough to triage on —
+        who is away, when, and under which policy — and identifies the request
+        it concerns through `time_off_request_id`. Balance figures for that
+        request come from the endpoints that own them.
+
+        Set `include` to sideload each review's request and the request's
+        per-date components, which carry the balance impact of every day the
+        request covers; the amount a request books is the sum of their
+        `balance_impact[].impact` values. Beyond that and pagination the
+        operation takes no parameters — there is one question to ask and the
+        token answers it.
+      security:
+        - BearerAuth: []
+        - BearerUserAuth: []
+      parameters:
+        - name: include
+          in: query
+          required: false
+          description: >-
+            Sideloads each review's request and its components into
+            `included`, and adds the linkage that connects them. This is the
+            only value accepted; any other is refused.
+          schema:
+            type: string
+            enum: ['time_off_request.time_off_request_components']
+        - name: page[number]
+          in: query
+          required: false
+          description: One-based index of the page to return.
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page[size]
+          in: query
+          required: false
+          description: >-
+            Records per page. Values above the maximum are rejected rather than
+            clamped, so a caller is never silently given a short page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/RequestReviewList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '404':
+          description: >-
+            The Time Off API is not available to the caller's organization.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /enrolled_policies:
+    get:
+      operationId: listEmployeeEnrolledPolicies
+      x-rise-scope: ["time_off:read"]
+      summary: List an employee's vacation balances and their policy rules
+      tags:
+        - Time Off
+      description: |
+        Returns the time-off policies an employee is enrolled in — their
+        vacation, sick and other balances — together with the rules a request
+        against each one has to satisfy.
+
+        Each row's `id` is the balance identifier: it is what identifies which
+        balance a time-off request is booked against, so this is the operation
+        to call before building one.
+
+        The rules travel on the row. `minimum_increment` is the step a
+        request's duration must be a multiple of, `balance_unit` the unit both
+        it and `maximum_balance` are expressed in, `work_hours` the length of a
+        working day, and `prevent_negative_balance` and `adjust_for_weekend`
+        decide whether a given payload is accepted. `prevent_negative_balance`
+        is only ever true for a payroll-driven policy; elsewhere a balance may
+        go negative.
+
+        Defaults to the balances of the employee the token identifies. A token
+        without an employee — a server-to-server integration — must name one
+        with `employee_id`, and sees only what its own access allows: an
+        employee it cannot reach returns an empty list rather than an error.
+
+        `current_balance` is how much of the balance is left right now, in
+        `balance_unit`.
+
+        Forward-looking amounts are not returned ready-made. Set
+        `include_projected_events` to get the ledger movements the balance is
+        made of, together with `balance_as_of`, and walk them from
+        `current_balance` to the date you care about, or call
+        `getEmployeeTimeOffBalancesAsOf` for the balance on one date. Each
+        event carries the amount it moves the balance by and a `purpose`
+        saying what moved it.
+        Which purposes appear depends on the policy: a payroll-held balance
+        reports `payroll_journal` history, projected `accrual`s and
+        `payroll_usage` bookings, while other policies report `accrual`,
+        `request` and whichever of `reset`, `expiry` and the adjustment
+        purposes they are configured for. It is off by default, and turning it
+        on makes the operation depend on the payroll service for every
+        payroll-held balance — where the default read degrades, this can fail
+        the whole request with a 503. The same setting returns the balance's
+        next accrual and reset dates, its `display_balance` and the other
+        fields a review of time off against it reads.
+
+        Set `include=policy` to sideload each row's policy rules — how it
+        accrues and resets — into `included`. Narrow the read to particular
+        balances with `id`.
+      security:
+        - BearerAuth: []
+        - BearerUserAuth: []
+      parameters:
+        - name: employee_id
+          in: query
+          required: false
+          description: >-
+            Whose enrollments to return. Defaults to the employee the token
+            identifies, and is required for a token that identifies none.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 2147483647
+            example: 12345
+        - name: id
+          in: query
+          required: false
+          description: >-
+            Balance identifiers to return, comma-separated. Applies within the
+            employee selected above, so an identifier outside it returns
+            nothing rather than an error. Each must be a positive integer; an
+            empty value is treated as absent.
+          schema:
+            type: string
+            pattern: '^[0-9]+(,[0-9]+)*$'
+            example: '23,54'
+        - name: include
+          in: query
+          required: false
+          description: >-
+            Sideloads each row's policy into `included`, once per distinct
+            policy, and adds the linkage from the row to it. This is the only
+            value accepted; any other is refused.
+          schema:
+            type: string
+            enum: ['policy']
+        - name: include_projected_events
+          in: query
+          required: false
+          description: >-
+            Whether to return each row's `adjustment_events`, the
+            `balance_as_of` they are walked from, the `dollar_balance` they
+            accumulate onto, and `display_balance`, `accrual_date`,
+            `reset_date`, `activation_date`, `balance_type` and
+            `balance_source`. Off by default; without it all nine are absent.
+            Send `true` or `false`; an empty value is treated as absent, and
+            any other value is refused.
+          schema:
+            type: string
+            enum: ['true', 'false']
+            default: 'false'
+            example: 'true'
+        - name: include_deactivated
+          in: query
+          required: false
+          description: >-
+            Whether to also return deactivated balances. A balance is
+            deactivated when the employee's employment ends, while time off
+            they booked before then can still be awaiting review. Off by
+            default. Send `true` or `false`; an empty value is treated as
+            absent, and any other value is refused.
+          schema:
+            type: string
+            enum: ['true', 'false']
+            default: 'false'
+            example: 'true'
+        - name: page[number]
+          in: query
+          required: false
+          description: One-based index of the page to return.
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page[size]
+          in: query
+          required: false
+          description: >-
+            Records per page. Values above the maximum are rejected rather than
+            clamped, so a caller is never silently given a short page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/EnrolledPolicyList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '404':
+          description: >-
+            The Time Off API is not available to the caller's organization.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          description: >-
+            A service this operation depends on did not respond. No balance
+            amount was produced; retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /enrolled_policies/balances:
+    get:
+      operationId: getEmployeeTimeOffBalancesAsOf
+      x-rise-scope: ["time_off:read"]
+      summary: Get an employee's vacation balances on a date
+      tags:
+        - Time Off
+      description: |
+        Returns, for each time-off policy an employee is enrolled in, the
+        balance they will have on `as_of`: today, or any date up to a year
+        from today. Dates are UTC calendar dates, and "today" is today in UTC,
+        so a caller west of UTC late in their day is already on the next date;
+        a refused `as_of` names the accepted range.
+
+        The figure is computed here, so there is nothing to walk. How it is
+        reached depends on where the balance is held:
+
+        - A balance held in this service is its ledger plus the accruals,
+          resets and expiries its policy will apply up to and including
+          `as_of`, capped at the policy's maximum. Time off already booked is
+          included from the day it was requested, as it is in
+          `current_balance`. On a policy that carries its whole balance over,
+          this figure keeps the balance across the reset, where summing
+          `adjustment_events` from `listEmployeeEnrolledPolicies` would
+          subtract a reset that does not happen. One exception: on such a
+          policy that also has a maximum, accruals after the reset are not
+          held to the maximum, so the figure can exceed it.
+        - A payroll-held balance moves only on pay dates. The figure is the
+          balance after the last pay date on or before `as_of`, and
+          `balance_as_of` is that pay date, which may be earlier than `as_of`.
+          Future pay dates are estimated from the recent accrual rate.
+
+        Unlimited policies have no balance and return `status: unlimited`. A
+        payroll-held balance returns `status: no_estimate` when the payroll
+        service holds no balance for it to read, on any date, and when it
+        cannot estimate one for a date after today. Both have a null
+        `balance`. When a balance was read but cannot be estimated forward,
+        today is still `projected`: its figure is that balance, which needs no
+        estimate. `current_balance` reads `0.0` wherever there was nothing to
+        read, as on `listEmployeeEnrolledPolicies`.
+
+        A policy's accruals, resets and expiries for today are written by a
+        daily run that starts no earlier than 10:00 UTC. Until it has run, a
+        balance held here leaves today's movements out, and so does every later
+        date's figure.
+
+        Defaults to the employee the token identifies. A token without an
+        employee must name one with `employee_id`, and an employee it cannot
+        reach returns an empty list rather than an error. Deactivated
+        balances are not returned.
+
+        The call reads only, and may be repeated freely.
+      security:
+        - BearerAuth: []
+        - BearerUserAuth: []
+      parameters:
+        - name: as_of
+          in: query
+          required: true
+          description: >-
+            The date to report balances on, from today to one year from today,
+            inclusive. Any other date is refused.
+          schema:
+            type: string
+            format: date
+            example: '2026-12-31'
+        - name: employee_id
+          in: query
+          required: false
+          description: >-
+            Whose balances to return. Defaults to the employee the token
+            identifies, and is required for a token that identifies none.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 2147483647
+            example: 12345
+        - name: id
+          in: query
+          required: false
+          description: >-
+            Balance identifiers to return, comma-separated, as on
+            `listEmployeeEnrolledPolicies`. Applies within the employee selected
+            above, so an identifier outside it returns nothing rather than an
+            error. An empty value is treated as absent.
+          schema:
+            type: string
+            pattern: '^([0-9]+(,[0-9]+)*)?$'
+            example: '23,54'
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalanceAsOfList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '404':
+          description: >-
+            The Time Off API is not available to the caller's organization.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          description: >-
+            A service this operation depends on did not respond. No balance
+            was produced; retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /time_off_calendar_events:
+    get:
+      operationId: listTimeOffCalendarAbsences
+      x-rise-scope: ["time_off:read"]
+      summary: List who is away over a date range
+      tags:
+        - Time Off
+      description: |
+        Returns the confirmed absences visible to the caller that fall in the
+        requested range — the roster answer to "who is away next week", in one
+        call and with no employee argument.
+
+        Visibility is the caller's own, and matches what they see in the web
+        application: colleagues in their primary teams and departments, anyone
+        reporting to them, requests they are a reviewer on, and themselves. The
+        operation takes no employee argument, so the token alone decides whose
+        roster is returned -- a client-credentials token receives the visible
+        set of the user it is issued for, not the whole organization, and a
+        token naming no user at all is refused with `400 invalid_params`,
+        because there is no employee argument to fall back on. A caller
+        holding the organization-wide time-off calendar permission sees the
+        whole organization. Employees outside that set never appear, so an
+        empty page means nobody visible is away, not that nobody is.
+
+        Only confirmed absences are listed. A request still awaiting a decision
+        is not an absence yet and is not included.
+
+        Each row is flat and self-contained: who is away, the first and last
+        dates, the policy, and whether those two days are whole or partial.
+        Read `start_increment` against `balance_unit` before describing a day
+        as a full absence — a half day is reported as a fraction, not as a
+        whole day.
+
+        Both dates are required and the range may span at most 366 days — a
+        calendar year, leap years included.
+      security:
+        - BearerAuth: []
+        - BearerUserAuth: []
+      parameters:
+        - name: start_date
+          in: query
+          required: true
+          description: First date of the range, inclusive.
+          schema:
+            type: string
+            format: date
+            example: '2026-08-01'
+        - name: end_date
+          in: query
+          required: true
+          description: >-
+            Last date of the range, inclusive. Must not be earlier than
+            `start_date`, and the span it closes may cover at most 366 days.
+          schema:
+            type: string
+            format: date
+            example: '2026-08-31'
+        - name: page[number]
+          in: query
+          required: false
+          description: One-based index of the page to return.
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page[size]
+          in: query
+          required: false
+          description: >-
+            Records per page. Values above the maximum are rejected rather than
+            clamped, so a caller is never silently given a short page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/vnd.api+json:
+              schema:
+                $ref: '#/components/schemas/TimeOffCalendarEventList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '404':
+          description: >-
+            The Time Off API is not available to the caller's organization.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '504':
+          description: >-
+            The employee directory did not respond, so the set of people
+            visible to the caller could not be resolved. No absences were
+            returned; retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /calculate_request_impact:
+    post:
+      operationId: previewTimeOffRequestImpact
+      x-rise-scope: ["time_off:read"]
+      summary: Preview what a time-off request would cost
+      tags:
+        - Time Off
+      description: |
+        Returns the balance a time-off request would consume, one entry per
+        date in the range.
+
+        The cost is not derivable from the enrollment alone: it depends on the
+        employee's work schedule and on the holiday calendar observed at their
+        location, neither of which this API publishes. A day that falls on a
+        holiday or a non-working day costs nothing; the first and last days
+        cost the increments supplied.
+
+        **This predicts cost, not acceptance.** No permission, blackout, or
+        balance validation is performed here, and a preview succeeding does not
+        mean the corresponding request would be accepted. Submission is the
+        only authority on that.
+
+        Note that submission may currently recompute weekend days differently
+        on policies configured not to adjust for weekends. Where the two
+        disagree, this endpoint's figures are the correct ones.
+
+        The call reads only: it creates and changes nothing, and may be
+        repeated freely.
+      security:
+        - BearerAuth: []
+        - BearerUserAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImpactPreviewRequest'
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactPreview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '404':
+          description: >-
+            No such enrolled policy is visible to the caller, or the Time Off
+            API is not available to their organization. The two are deliberately
+            indistinguishable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '504':
+          description: >-
+            A service this preview depends on did not respond. The request was
+            not processed; retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /review_responses:
+    post:
+      operationId: createReviewResponse
+      x-rise-scope: ["time_off:write"]
+      summary: Approve or reject a time-off review
+      tags:
+        - Time Off
+      description: |
+        Records the authenticated reviewer's decision on one time-off review.
+
+        **A review is the request's approval, and a decision is one reviewer's
+        vote on it.** A request may be assigned to several reviewers, who all
+        vote on the same review. Send the id of a review — the ids the reviewer
+        queue returns — not the id of the request it belongs to.
+
+        **`action` is `approve` or `reject`.** Asking the employee to change the
+        request before deciding is a third action in the Rise web application;
+        it is not accepted here in this version, and a request for it is
+        refused as an unsupported value.
+
+        **Only a reviewer assigned to the request under review may decide it.**
+        Standing comes from the assignment alone. Elevated permissions that let
+        somebody approve another person's request inside the Rise web
+        application grant nothing here, so a person who can approve there is
+        refused on the same review — `403`, or `404` where the review belongs to
+        a request of their own that they are not assigned to review. That is the
+        policy of this operation, not an oversight. A review that is not the
+        caller's — or that does not exist — is `404` either way, so the
+        operation never reveals whether an id it will not act on exists.
+
+        **What the `201` promises.** It confirms that *this caller's decision
+        was recorded*; that decision is the resource being created.
+        `review_state` says where the review itself landed once the decision was
+        counted, so a caller can tell a settling vote from a pending one without
+        a second call. `in_review` there means the review is still open because
+        the request's reviewer group needs more approvals than it has — the
+        group's quorum. `approved` or `rejected` means this vote settled it.
+
+        A rejection settles a review on the first vote; it is never subject to
+        quorum. An approval is, wherever the group requires the agreement of
+        every reviewer rather than any one of them.
+
+        **What the `201` does not promise.** `review_state` is the state of the
+        review, not the status of the time-off request. The request's own
+        transition runs while this call is in flight, but a request in
+        `suspended`, whose reviewer list is being rebuilt, does not transition
+        at all — so a review can reach `approved` while the request it belongs
+        to is not yet confirmed. Read the request's current status from
+        `listEmployeeTimeOffRequests` with `employee_id` set to the requester;
+        a reviewer can see the requests they review.
+
+        **A decision cannot be withdrawn through this API.** While a review is
+        still open, a reviewer may decide again, and each decision is recorded:
+        approving again changes nothing, and rejecting after approving settles
+        the review as `rejected`. Once the review has settled, further
+        decisions are refused with `409`. Deciding on another reviewer's behalf
+        is not offered in this version; the remedy is the Rise web application.
+
+        **`comment` is write-only.** It is stored with the decision and is
+        returned by no operation on this surface.
+
+        **`Idempotency-Key` is required, and de-duplication is the gateway's.**
+        This service stores no key, caches no response and de-duplicates
+        nothing: a retry the gateway recognises is served its first answer and
+        never reaches this operation. Every answer below `500` is replayed,
+        refusals included — a `400`, a `404`, or the gateway's own `429` — so
+        after a refusal, correct the request if needed and send it under a new
+        key. A key is remembered for 24 hours and is scoped to the OAuth client
+        and the user the token names; use a fresh UUID per decision.
+        Protection is best-effort: a retry sent before the first request has
+        answered, after an answer of `500` or above (including a gateway
+        timeout), or while the gateway's cache is unavailable reaches this
+        operation a second time. There it is recorded as a further decision
+        while the review is open — a repeated approval changes nothing — or
+        meets the review already decided.
+
+        **`409` has two authors, told apart by the body.** The gateway answers
+        `409` as `application/problem+json` when one key is replayed with a
+        different payload after the first request has answered below `500`, or
+        when the first request completed but its response cannot be replayed —
+        the decision may then have been recorded. This operation answers `409`
+        as `application/json` with `code: review_already_decided`, meaning the
+        review is no longer open — someone decided it, or the employee withdrew
+        the request. Only this operation's `409` is worth re-reading the review
+        over.
+      security:
+        - BearerAuth: []
+        - BearerUserAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: >-
+            Client-generated token identifying this decision, at most 256
+            characters. Replay and conflict are handled at the gateway, which
+            scopes the key to the OAuth client and the token's user, if it
+            names one, remembers it for 24 hours once the request has answered
+            below `500`, and fails open when its cache is unavailable. Use a
+            fresh unguessable value per decision. This service stores nothing.
+          schema:
+            type: string
+            maxLength: 256
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateReviewResponse'
+      responses:
+        '201':
+          description: >-
+            The decision was recorded. `review_state` reports where the review
+            landed once it was counted.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedReviewResponseDocument'
+        '400':
+          description: >-
+            The body was refused with `code: invalid_params` — a malformed body,
+            an unsupported field, an `action` outside `approve` and `reject`, a
+            `request_review_id` that is not a positive integer, a `comment` past
+            its length bound, or a missing `Idempotency-Key`. A key longer than
+            256 characters is refused by the gateway before this service sees
+            the request, as `application/problem+json` with type
+            `idempotency-key-too-long`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: >-
+            The caller may see this review but may not decide it, or the token
+            names no employee, so there is no reviewer to record the decision
+            for; or its granted scope does not cover this operation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: >-
+            No such review is visible to the caller, or the Time Off API is not
+            available to their organization. An absent review, another
+            organization's, and one the caller has no part in are deliberately
+            indistinguishable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          description: >-
+            Either the review is no longer open — `code:
+            review_already_decided`, in `application/json` — or the gateway
+            reports the same `Idempotency-Key` replayed with a different
+            payload, or a first response it cannot replay, in
+            `application/problem+json`. Tell them apart by the body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+        '411':
+          $ref: '#/components/responses/IdempotencyLengthRequired'
+        '413':
+          $ref: '#/components/responses/IdempotencyPayloadTooLarge'
+        '415':
+          description: The body was not sent as `application/json`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '504':
+          description: >-
+            A service the decision depends on did not respond in time —
+            approving needs the requester's employment record. The decision was
+            not recorded; retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+# ---------------------------------------------------------------------------
+# Components
+# ---------------------------------------------------------------------------
+components:
+
+  schemas:
+    ImpactPreviewRequest:
+      type: object
+      description: >-
+        Deliberately NOT the create's component vocabulary: this accepts no
+        `days`. The create's per-day amounts are the caller's own numbers, so
+        there is nothing for a costing to tell them — and every date they do
+        not name is priced by the same projection this endpoint uses, so those
+        agree with what books. Overlay your own amounts onto the `days` this
+        returns to get the adjusted total.
+      additionalProperties: false
+      required:
+        - enrolled_policy_id
+        - start_date
+        - end_date
+        - start_increment
+        - end_increment
+      properties:
+        enrolled_policy_id:
+          type: string
+          description: >-
+            The enrollment to price the request against, as returned by the
+            enrolled policies endpoint. At most 2147483647; a larger value is
+            refused.
+          pattern: '^[0-9]{1,10}$'
+        start_date:
+          type: string
+          format: date
+          description: First date of the request, inclusive.
+        end_date:
+          type: string
+          format: date
+          description: >-
+            Last date of the request, inclusive. Must not precede
+            `start_date`, and the range may not exceed 366 days.
+        start_increment:
+          type: string
+          description: >-
+            Amount consumed on the first day, in the enrollment's balance unit
+            — a portion of a day, or a number of hours. Non-negative.
+          pattern: '^[0-9]{1,12}(\.[0-9]{1,6})?$'
+        end_increment:
+          type: string
+          description: >-
+            Amount consumed on the last day, in the same unit. Ignored when the
+            request covers a single day, which takes `start_increment`.
+          pattern: '^[0-9]{1,12}(\.[0-9]{1,6})?$'
+        is_working:
+          type: boolean
+          description: >-
+            Price every day as worked, including days that would otherwise cost
+            nothing. Only a time-worked-accrual policy can honour this, and
+            sending `true` for any other enrollment is rejected rather than
+            ignored; `false` is the default and is accepted everywhere. Note
+            that `true` asks a different question — what these days would cost
+            if worked — rather than what the request will cost.
+
+    ImpactPreview:
+      type: array
+      description: >-
+        One entry per date in the requested range, in order, both endpoints
+        included.
+      items:
+        $ref: '#/components/schemas/DayImpact'
+
+    DayImpact:
+      type: object
+      required:
+        - date
+        - impact
+      properties:
+        date:
+          type: string
+          format: date
+        impact:
+          type: number
+          format: double
+          description: >-
+            Balance consumed on this date, in the enrollment's balance unit.
+            Zero on a day the employee does not work.
+
+    TimeOffRequestStatus:
+      type: string
+      description: >-
+        Lifecycle state of the request. Treat as an open enum — new values may
+        be added without a major version bump.
+      enum:
+        - initializing
+        - in_progress
+        - in_review
+        - confirmed
+        - rejected
+        - closed
+        - suspended
+      example: confirmed
+
+    TimeOffRequest:
+      type: object
+      required: [id, type, attributes]
+      properties:
+        id:
+          type: string
+          description: Unique identifier for the request.
+          example: '456'
+        type:
+          type: string
+          description: Resource type discriminator.
+          example: time_off_requests
+        attributes:
+          type: object
+          required: [employee_id, request_status, start_date, end_date]
+          properties:
+            employee_id:
+              type: string
+              description: Employee the request belongs to.
+              example: '12345'
+            employee_name:
+              type: string
+              description: >-
+                Display name of the employee. Absent where the employee's name
+                is not visible to the caller, so treat it as optional.
+              example: Shirley Bennett
+              x-sensitive: true
+            request_status:
+              $ref: '#/components/schemas/TimeOffRequestStatus'
+            start_date:
+              type: string
+              format: date
+              description: First date covered by the request.
+              example: '2026-08-04'
+            end_date:
+              type: string
+              format: date
+              description: Last date covered by the request.
+              example: '2026-08-07'
+        relationships:
+          type: object
+          description: >-
+            Present only on a request sideloaded through the reviewer queue's
+            `include`.
+          properties:
+            time_off_request_components:
+              type: object
+              properties:
+                data:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/ResourceIdentifier'
+
+    TimeOffRequestComponent:
+      type: object
+      required: [id, type, attributes]
+      description: >-
+        One line of a time-off request: a run of dates booked against one
+        balance. Sideloaded through the reviewer queue's `include`.
+      properties:
+        id:
+          type: string
+          description: Unique identifier for the component.
+          example: '901'
+        type:
+          type: string
+          description: Resource type discriminator.
+          example: time_off_request_components
+        attributes:
+          type: object
+          description: The component's dates, amounts and balance.
+          required:
+            - enrolled_policy_id
+            - time_off_request_id
+            - start_date
+            - end_date
+            - leaving_at
+            - returning_at
+            - is_working
+            - balance_impact
+          properties:
+            enrolled_policy_id:
+              type: [string, 'null']
+              description: >-
+                The balance the component is booked against — the `id` of a
+                row from the enrolled policies operation.
+              example: '23'
+            time_off_request_id:
+              type: string
+              description: The request the component belongs to.
+              example: '456'
+            start_date:
+              type: [string, 'null']
+              format: date
+              description: First date the component covers.
+              example: '2026-08-04'
+            end_date:
+              type: [string, 'null']
+              format: date
+              description: Last date the component covers.
+              example: '2026-08-07'
+            leaving_at:
+              type: [string, 'null']
+              description: >-
+                Local time of day the employee leaves on `start_date`, in the
+                same lenient form as the review row's `leaving_at`.
+              example: '13:00'
+            returning_at:
+              type: [string, 'null']
+              description: >-
+                Local time of day the employee returns on `end_date`.
+              example: '09:00'
+            is_working:
+              type: [boolean, 'null']
+              description: >-
+                Whether the component records time worked, which adds to the
+                balance, rather than time away, which takes from it.
+              example: false
+            balance_impact:
+              type: array
+              description: >-
+                How much each date the component covers moves the balance by,
+                in the balance's unit, in date order. Positive either way: the
+                direction follows `is_working`.
+              items:
+                type: object
+                required: [date, impact, calculated_impact]
+                properties:
+                  date:
+                    type: string
+                    format: date
+                    example: '2026-08-04'
+                  impact:
+                    type: string
+                    description: >-
+                      The amount booked against the balance for the date.
+                    example: '0.5'
+                  calculated_impact:
+                    type: [string, 'null']
+                    description: >-
+                      The amount the policy's rules give for the date. Where it
+                      differs from `impact`, the amount was set by hand.
+                    example: '1.0'
+
+    ResourceIdentifier:
+      type: object
+      required: [type, id]
+      properties:
+        type:
+          type: string
+          description: Type of the linked record.
+        id:
+          type: string
+          description: Identifier of the linked record.
+
+    CreateTimeOffRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - components
+      properties:
+        employee_id:
+          type: string
+          pattern: '^[0-9]{1,10}$'
+          description: >-
+            The employee to file the request for. Omit it, or name the caller,
+            to file for the caller. Any other employee must be one the caller
+            manages or leads, or the caller must hold the permission to record
+            time off taken; the request is then created `confirmed`, without
+            review. At most 2147483647; a larger value is refused.
+          example: '12345'
+        comment:
+          type: string
+          maxLength: 2000
+          description: >-
+            Note to accompany the request, authored as the caller. Returned
+            only to the request's reviewers, while it is the latest note.
+        components:
+          type: array
+          minItems: 1
+          maxItems: 1
+          description: >-
+            One entry per enrollment the request draws on. Together they must
+            cover one unbroken date range, and no two may cover the same date.
+          items:
+            $ref: '#/components/schemas/CreateTimeOffRequestComponent'
+
+    CreateTimeOffRequestComponent:
+      type: object
+      additionalProperties: false
+      required:
+        - enrolled_policy_id
+        - start_date
+        - end_date
+      properties:
+        enrolled_policy_id:
+          type: string
+          description: >-
+            The enrollment to book against, as returned by the enrolled policies
+            endpoint. At most 2147483647; a larger value is refused.
+          pattern: '^[0-9]{1,10}$'
+        start_date:
+          type: string
+          format: date
+          description: First date of this component, inclusive.
+        end_date:
+          type: string
+          format: date
+          description: >-
+            Last date of this component, inclusive. Must not precede
+            `start_date`, and the range may not exceed 366 days.
+        start_increment:
+          type: string
+          description: >-
+            Amount consumed on the first day, in the enrollment's balance unit.
+            Defaults to a whole day, or to the enrollment's working hours where
+            the balance is measured in hours. Must be at least the enrollment's
+            `minimum_increment`, which the enrolled policies endpoint publishes
+            — a half day is refused by a policy booked in whole days. At most
+            `1` where the balance unit is `days` and `24` where it is `hours`.
+          pattern: '^[0-9]{1,12}(\.[0-9]{1,6})?$'
+        end_increment:
+          type: string
+          description: >-
+            Amount consumed on the last day, in the same unit, with the same
+            default and the same bounds. Ignored where the component covers a
+            single day, which takes `start_increment`.
+          pattern: '^[0-9]{1,12}(\.[0-9]{1,6})?$'
+        days:
+          type: array
+          description: >-
+            Per-day amounts, for the dates that should not cost what the server
+            would price them at. **Sparse**: name only the dates that differ,
+            and every other date in the range keeps its computed amount — so a
+            holiday or a non-working day inside the range still costs nothing
+            unless you say otherwise.
+
+            This is how a part day in the MIDDLE of a range is expressed, and
+            only that: a date here must fall STRICTLY INSIDE the component's
+            range. The first and last day are set by `start_increment` and
+            `end_increment`, and naming either of them here is refused rather
+            than allowed to override them — one date, one vocabulary. A
+            component covering one or two days therefore takes no `days` at
+            all; its increments already describe every date it has.
+
+            An amount of `0` is meaningful and is not the same as omitting the
+            date: it books the day as part of the absence at no cost. No date
+            may appear twice.
+
+            The impact preview accepts no `days`, so it cannot price these for
+            you. Every date you do not name is priced identically by both, so
+            overlaying your own amounts onto the preview's per-day costs gives
+            the total this endpoint will book.
+          minItems: 1
+          maxItems: 366
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - date
+              - amount
+            properties:
+              date:
+                type: string
+                format: date
+                description: >-
+                  A date strictly inside this component's range — later than
+                  `start_date` and earlier than `end_date`.
+              amount:
+                type: string
+                description: >-
+                  What this date consumes, in the enrollment's balance unit.
+                  At most `1` where the balance unit is `days` and `24` where
+                  it is `hours`. Unlike the increments it has no lower bound
+                  beyond zero: `minimum_increment` governs the first and last
+                  day of a component, which are the two dates this may not
+                  name.
+                pattern: '^[0-9]{1,12}(\.[0-9]{1,6})?$'
+
+    CreatedTimeOffRequestDocument:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/CreatedTimeOffRequest'
+
+    CreatedTimeOffRequest:
+      type: object
+      required: [id, type, attributes]
+      properties:
+        id:
+          type: string
+          description: Identifier of the request just created.
+          example: '456'
+        type:
+          type: string
+          description: Resource type discriminator, shared with the list operation.
+          example: time_off_requests
+        attributes:
+          type: object
+          required: [employee_id, request_status, start_date, end_date, components]
+          properties:
+            employee_id:
+              type: string
+              description: >-
+                The employee the request was filed for: the caller, or the
+                employee named in `employee_id`.
+              example: '12345'
+            request_status:
+              allOf:
+                - $ref: '#/components/schemas/TimeOffRequestStatus'
+                - description: >-
+                    `in_progress` on creation for a request filed for the
+                    caller; reviewer resolution runs in the background and
+                    advances this within moments, so read the current value
+                    from the list operation. `confirmed` for a request filed
+                    for someone else.
+            start_date:
+              type: string
+              format: date
+              description: Earliest date any component covers.
+              example: '2026-08-04'
+            end_date:
+              type: string
+              format: date
+              description: Latest date any component covers.
+              example: '2026-08-07'
+            components:
+              type: array
+              description: One entry per enrollment the request draws on, as submitted.
+              items:
+                $ref: '#/components/schemas/CreatedRequestComponent'
+
+    CreatedRequestComponent:
+      type: object
+      required:
+        - enrolled_policy_id
+        - start_date
+        - end_date
+        - start_increment
+        - end_increment
+        - balance_unit
+        - debit_timing
+        - days
+      properties:
+        enrolled_policy_id:
+          type: string
+          description: The enrollment this component was booked against.
+          example: '456'
+        start_date:
+          type: string
+          format: date
+        end_date:
+          type: string
+          format: date
+        start_increment:
+          type: number
+          format: double
+          description: Amount consumed on the first day, defaulted where not supplied.
+        end_increment:
+          type: number
+          format: double
+          description: Amount consumed on the last day, defaulted where not supplied.
+        balance_unit:
+          $ref: '#/components/schemas/BalanceUnit'
+        debit_timing:
+          type: string
+          description: >-
+            When the balance is actually reduced, as a property of the policy
+            model. Treat as an open enum. `submission`: reserved now, when the
+            request is submitted. `pay_date`: moved when payroll runs the
+            covering period.
+          example: submission
+        days:
+          type: array
+          description: >-
+            What this component costs, one entry per date it covers, both
+            endpoints included. Each is the amount supplied for that date in
+            the request's `days`, or the server's own price for every date
+            that was not named there.
+
+            Note the member is `impact` here and `amount` on the way in: the
+            request states what a date should cost, the response states what
+            it did.
+          items:
+            $ref: '#/components/schemas/DayImpact'
+
+    TimeOffRequestList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          description: Requests for this page, oldest first by record id.
+          items:
+            $ref: '#/components/schemas/TimeOffRequest'
+        meta:
+          type: object
+          properties:
+            count:
+              type: integer
+              description: >-
+                Total records in the filtered result set, not just this page.
+              example: 57
+
+    RequestReviewState:
+      type: string
+      description: >-
+        Lifecycle state of the review. Treat as an open enum — new values may
+        be added without a major version bump. A review in the queue is always
+        `in_review`; the other values describe how a review was closed and are
+        listed so a client is not surprised by one.
+      enum:
+        - in_review
+        - approved
+        - rejected
+        - modifications_requested
+        - modified
+        - closed
+      example: in_review
+
+    RequestReview:
+      type: object
+      required: [id, type, attributes]
+      properties:
+        id:
+          type: string
+          description: Unique identifier for the review.
+          example: '789'
+        type:
+          type: string
+          description: Resource type discriminator.
+          example: request_reviews
+        attributes:
+          type: object
+          required:
+            - state
+            - time_off_request_id
+            - employee_id
+            - employee_name
+            - start_date
+            - end_date
+            - policy_name
+            - balance_unit
+            - leaving_at
+            - returning_at
+            - created_at
+            - comment
+          properties:
+            state:
+              $ref: '#/components/schemas/RequestReviewState'
+            time_off_request_id:
+              type: string
+              description: >-
+                The request under review. Use it to fetch the request itself or
+                the requesting employee's balances.
+              example: '456'
+            employee_id:
+              type: [string, 'null']
+              description: >-
+                Employee who made the request under review. Null only for a
+                request that carries no employee, which the queue does not
+                expect to surface.
+              example: '12345'
+            employee_name:
+              type: [string, 'null']
+              description: >-
+                Display name of the requesting employee. Null where the name is
+                not recorded on the request, so treat it as optional.
+              example: Shirley Bennett
+              x-sensitive: true
+            start_date:
+              type: [string, 'null']
+              format: date
+              description: >-
+                First date covered by the request under review. Null for a
+                request with no dated components.
+              example: '2026-08-04'
+            end_date:
+              type: [string, 'null']
+              format: date
+              description: >-
+                Last date covered by the request under review. Null for a
+                request with no dated components.
+              example: '2026-08-07'
+            policy_name:
+              type: [string, 'null']
+              description: >-
+                Name of the time-off policy the request draws on. The literal
+                `-` where the policy's name is withheld from the caller, which
+                is how a policy marked private appears to someone outside the
+                requesting employee's reporting or review line. Null for a
+                request with no dated components, or whose balance is not
+                linked to a policy.
+              example: Vacation
+            balance_unit:
+              oneOf:
+                - $ref: '#/components/schemas/BalanceUnit'
+                - type: 'null'
+              description: >-
+                Unit the request is measured in. Null where the unit is not
+                recorded, which includes a request with no dated components.
+            leaving_at:
+              type: [string, 'null']
+              description: >-
+                Local time of day the employee leaves on `start_date`. The
+                hour may or may not be zero-padded — both `9:30` and `09:30`
+                occur — so parse leniently. Null where the request does not
+                record one, which is usual for whole-day leave.
+              example: '13:00'
+            returning_at:
+              type: [string, 'null']
+              description: >-
+                Local time of day the employee returns on `end_date`, in the
+                same unpadded form as `leaving_at`. Null where the request does
+                not record one.
+              example: '09:00'
+            created_at:
+              type: string
+              format: date
+              description: Date the review was raised.
+              example: '2026-08-01'
+            comment:
+              type: [string, 'null']
+              description: >-
+                The most recent comment on the request under review, as the
+                requesting employee's reviewers see it. Null where the request
+                carries none.
+              example: Back on Monday
+              x-sensitive: true
+        relationships:
+          type: object
+          description: >-
+            Present only when the request is sideloaded with `include`.
+          properties:
+            time_off_request:
+              type: object
+              properties:
+                data:
+                  $ref: '#/components/schemas/ResourceIdentifier'
+
+    RequestReviewList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          description: Reviews for this page, oldest first by record id.
+          items:
+            $ref: '#/components/schemas/RequestReview'
+        included:
+          type: array
+          description: >-
+            The reviews' requests and their components, present only with
+            `include`.
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/TimeOffRequest'
+              - $ref: '#/components/schemas/TimeOffRequestComponent'
+        meta:
+          type: object
+          properties:
+            count:
+              type: integer
+              description: >-
+                Total records in the queue, not just this page.
+              example: 12
+
+    CreateReviewResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - request_review_id
+        - action
+      properties:
+        request_review_id:
+          type: string
+          description: >-
+            The review to decide, as returned by the reviewer queue. Not the id
+            of the time-off request the review belongs to. At least 1 and at
+            most 2147483647; a value outside that range is refused.
+          pattern: '^[0-9]{1,10}$'
+          example: '789'
+        action:
+          type: string
+          description: The decision to record.
+          enum:
+            - approve
+            - reject
+          example: approve
+        comment:
+          type: string
+          maxLength: 2000
+          description: >-
+            Note to accompany the decision, authored as the caller. Stored, and
+            returned by no operation on this surface.
+
+    CreatedReviewResponseDocument:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/CreatedReviewResponse'
+
+    CreatedReviewResponse:
+      type: object
+      required: [id, type, attributes]
+      properties:
+        id:
+          type: string
+          description: Identifier of the decision just recorded.
+          example: '4412'
+        type:
+          type: string
+          description: Resource type discriminator.
+          example: review_responses
+        attributes:
+          type: object
+          required:
+            - request_review_id
+            - action
+            - created_at
+            - time_off_request_id
+            - review_state
+          properties:
+            request_review_id:
+              type: string
+              description: The review this decision was recorded against.
+              example: '789'
+            action:
+              type: string
+              description: The decision recorded, as submitted.
+              enum:
+                - approve
+                - reject
+              example: approve
+            created_at:
+              type: string
+              format: date-time
+              description: >-
+                Instant the decision was recorded, in UTC and always carrying
+                the `Z` suffix.
+              example: '2026-09-17T10:04:11Z'
+            time_off_request_id:
+              type: string
+              description: The time-off request the decided review belongs to.
+              example: '1201'
+            review_state:
+              allOf:
+                - $ref: '#/components/schemas/RequestReviewState'
+                - description: >-
+                    Where the review landed once this decision was counted —
+                    `in_review` while the reviewer group still needs further
+                    approvals, otherwise the state this vote settled it at. It
+                    is the review's state, not the request's status.
+
+    TimeOffCalendarEvent:
+      type: object
+      required: [id, type, attributes]
+      properties:
+        id:
+          type: string
+          description: >-
+            Unique identifier for the absence, and for the time-off request
+            behind it.
+          example: '456'
+        type:
+          type: string
+          description: Resource type discriminator.
+          example: time_off_calendar_events
+        attributes:
+          type: object
+          required:
+            - employee_id
+            - employee_name
+            - start_date
+            - end_date
+            - policy_name
+            - badge_color
+            - badge_icon
+            - balance_unit
+            - start_increment
+            - end_increment
+            - leaving_at
+            - returning_at
+          properties:
+            employee_id:
+              type: string
+              description: Employee who is away.
+              example: '12345'
+            employee_name:
+              type: [string, 'null']
+              description: >-
+                Display name of the employee who is away, reflecting the
+                employee directory as it stands when the request is served, so
+                a renamed employee is returned under their current name. Null
+                where the directory has no record for them, so treat it as
+                optional.
+              example: Shirley Bennett
+              x-sensitive: true
+            start_date:
+              type: [string, 'null']
+              format: date
+              description: >-
+                First date of the absence. Null for a request with no dated
+                components.
+              example: '2026-08-04'
+            end_date:
+              type: [string, 'null']
+              format: date
+              description: >-
+                Last date of the absence. Null for a request with no dated
+                components.
+              example: '2026-08-06'
+            policy_name:
+              type: [string, 'null']
+              description: >-
+                Policy the absence is booked against. Where the policy's name
+                is private and the caller is not entitled to see this
+                employee's balances, the name is withheld and this reads `-`;
+                present that as undisclosed rather than showing the literal.
+                Null where the absence records no policy, and where the
+                caller can see that the employee is away but not why.
+              example: Vacation
+              x-sensitive: true
+            badge_color:
+              type: [string, 'null']
+              description: >-
+                Colour of the badge for the policy this absence is booked
+                against, for displaying it consistently with the Rise
+                interface — the same value and the same rules as `badge_color`
+                on `EnrolledPolicy`. A neutral placeholder colour where the
+                policy's name is private to the caller; null where the policy
+                has no badge configured, and where the caller can see that the
+                employee is away but not why.
+                Presentation only: it carries no meaning about the leave.
+              example: '#1B7F79'
+            badge_icon:
+              type: [string, 'null']
+              description: >-
+                Icon name for the badge of the policy this absence is booked
+                against — the same value and the same rules as `badge_icon` on
+                `EnrolledPolicy`. Null when the policy has no badge or no
+                icon on it, when its name is private to the caller, and where
+                the caller can see that the employee is away but not why.
+                Unlike `badge_color` there is no placeholder, so null does not
+                distinguish those cases; read `policy_name` for that.
+              example: palm-tree
+            balance_unit:
+              oneOf:
+                - $ref: '#/components/schemas/BalanceUnit'
+                - type: 'null'
+              description: >-
+                Unit the increments below are measured in. Null where the unit
+                is not recorded, and where the caller can see that the employee
+                is away but not why.
+            start_increment:
+              type: [number, 'null']
+              format: float
+              description: >-
+                How much of `start_date` the absence covers, in `balance_unit`.
+                A fraction of the working day when the unit is `days`, so `0.5`
+                is a half day; a count of hours when the unit is `hours`. On a
+                single-day absence this is its whole duration. Null where the
+                caller can see that the employee is away but not why.
+              example: 0.5
+            end_increment:
+              type: [number, 'null']
+              format: float
+              description: >-
+                How much of `end_date` the absence covers, on the same scale as
+                `start_increment`. Carries no meaning when `start_date` and
+                `end_date` are the same day: the absence is one day long,
+                `start_increment` is its whole duration, and this field is left
+                at a default that is often a full day. Read it only across a
+                multi-day absence, and never add the two together.
+              example: 1
+            leaving_at:
+              type: [string, 'null']
+              description: >-
+                Local time of day the employee leaves on `start_date`. The hour
+                may or may not be zero-padded — both `9:30` and `09:30` occur —
+                so parse leniently. Null where none is recorded, which is usual
+                for whole-day leave.
+              example: '13:00'
+            returning_at:
+              type: [string, 'null']
+              description: >-
+                Local time of day the employee returns on `end_date`, in the
+                same unpadded form as `leaving_at`. Null where none is
+                recorded.
+              example: '09:00'
+
+    TimeOffCalendarEventList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          description: Absences for this page.
+          items:
+            $ref: '#/components/schemas/TimeOffCalendarEvent'
+        meta:
+          type: object
+          properties:
+            count:
+              type: integer
+              description: >-
+                Total absences in the range visible to the caller, not just
+                this page.
+              example: 12
+
+    BalanceUnit:
+      type: string
+      description: >-
+        Unit that this policy's balance, increments and maximum are expressed
+        in. Treat as an open enum — new values may be added without a major
+        version bump.
+      enum:
+        - hours
+        - days
+      example: days
+
+    EnrolledPolicy:
+      type: object
+      required: [id, type, attributes]
+      properties:
+        id:
+          type: string
+          description: >-
+            Balance identifier. This is the value that identifies which balance
+            a time-off request is booked against.
+          example: '789'
+        type:
+          type: string
+          description: Resource type discriminator.
+          example: enrolled_policies
+        attributes:
+          type: object
+          required:
+            - name
+            - balance_unit
+            - minimum_increment
+            - maximum_balance
+            - work_hours
+            - enrollment_date
+            - prevent_negative_balance
+            - adjust_for_weekend
+            - badge_color
+            - badge_icon
+            - current_balance
+          properties:
+            name:
+              type: string
+              description: >-
+                Policy name, for example Vacation or Sick. Returned as `-` when
+                the policy's name is private and the caller may not see it.
+              example: Vacation
+            balance_unit:
+              $ref: '#/components/schemas/BalanceUnit'
+            minimum_increment:
+              type: string
+              description: >-
+                Step, in `balance_unit`, that a request's duration must be a
+                multiple of, as a decimal string. Empty where the policy sets
+                none.
+              example: '0.5'
+            maximum_balance:
+              type: string
+              description: >-
+                Cap on the balance, in `balance_unit`, as a decimal string.
+                Empty where the policy is uncapped.
+              example: '30.0'
+            work_hours:
+              type: [number, 'null']
+              description: >-
+                Hours in a working day under this policy, used to convert
+                between days and hours. Null where the policy sets none.
+              example: 8
+            enrollment_date:
+              type: string
+              description: >-
+                Date the employee was enrolled in this policy, as `YYYY-MM-DD`.
+                Empty where no enrollment date is recorded.
+              example: '2024-03-01'
+            prevent_negative_balance:
+              type: boolean
+              description: >-
+                Whether a request that would take this balance below zero is
+                refused. Only ever true for a payroll-driven policy.
+              example: false
+            adjust_for_weekend:
+              type: [boolean, 'null']
+              description: >-
+                Whether dates falling on a weekend are excluded from a
+                request's duration. Null behaves the same as false: weekend
+                dates count toward the duration.
+              example: true
+            badge_color:
+              type: [string, 'null']
+              description: >-
+                Colour of the policy's badge, for displaying it consistently
+                with the Rise interface. A neutral placeholder colour where the
+                policy's name is private to the caller.
+              example: '#1B7F79'
+            badge_icon:
+              type: [string, 'null']
+              description: >-
+                Icon name for the policy's badge. Null when the policy has no
+                badge, or its name is private to the caller.
+              example: palm-tree
+            current_balance:
+              type: string
+              description: >-
+                How much of the balance is left right now, expressed in
+                `balance_unit` as a decimal string rounded to two places. May be
+                negative where the policy permits it — see
+                `prevent_negative_balance`.
+
+                A payroll-held balance that could not be retrieved is reported
+                as zero, not null, and is indistinguishable from a balance that
+                is genuinely zero.
+              example: '12.5'
+            dollar_balance:
+              type: [string, 'null']
+              description: >-
+                The dollar total a walk over `adjustment_events` accumulates
+                each event's `dollar_value` onto, as a decimal string with two
+                places.
+
+                Present only when `include_projected_events` is set. It is null
+                on a balance not held in payroll or not denominated in dollars,
+                for a token identifying no user, and for a user not permitted to
+                see the employee's compensation.
+
+                It is normally `current_balance` valued in dollars, but the two
+                are read by different paths and can disagree: where the
+                employee's pay rate cannot be resolved, `current_balance` falls
+                back to zero while this field keeps its value, and every event's
+                `dollar_value` is null. Do not derive a rate by dividing
+                one by the other.
+              example: '1425.50'
+            balance_as_of:
+              type: [string, 'null']
+              format: date
+              description: >-
+                Date `current_balance` is accurate as of, and the point a walk
+                over `adjustment_events` starts from: apply the events dated
+                after it, and none dated on or before it.
+
+                Present only when `include_projected_events` is set. It is
+                null for a payroll-held balance whose payroll link cannot be
+                resolved, and one whose pay schedule could not be read — so treat null as
+                "no cutoff available" and do not walk, rather than as a
+                particular cause.
+              example: '2026-09-15'
+            adjustment_events:
+              type: array
+              description: >-
+                Ledger movements on this balance — accruals, booked time off
+                and whatever else the policy produces. Present only when
+                `include_projected_events` is set.
+
+                Returned in the order the balance applies them: recorded
+                movements in ledger order, then forecast ones by date. Walk
+                them in that order.
+
+                Recorded movements cover the balance's whole ledger history,
+                or the last 24 months of the payroll journal for a
+                payroll-held balance. The list is not paginated, so a
+                long-tenured employee's balance can carry hundreds of events.
+
+                For a payroll-held balance the forecast runs two years ahead,
+                or to the end of the latest booked time off if that is later,
+                and never more than three years. For any other balance it runs
+                one year from tomorrow.
+
+                Events dated after `balance_as_of` are not reflected in
+                `current_balance`, so walking those from it gives the balance
+                at a later date. A record already recorded against the balance
+                but dated in the future — which the ordinary booking flows do
+                not produce — would be counted in both, so reconcile against
+                `current_balance` rather than assuming the sum is exact.
+              items:
+                $ref: '#/components/schemas/AdjustmentEvent'
+            display_balance:
+              type: string
+              description: >-
+                The balance through the next reset — or, where the policy has
+                no reset, through the next yearly accrual: `current_balance`
+                with the time off already booked after that point added back,
+                since booking debits the balance at once. For an unlimited
+                policy the point is the reset rule's next date. Equal to
+                `current_balance`, rounded to two places, where there is no
+                such point, and for a payroll-held balance. A decimal string
+                in `balance_unit`.
+                Present only when `include_projected_events` is set.
+              example: '10.5'
+            accrual_date:
+              type: [string, 'null']
+              format: date
+              description: >-
+                Date of the balance's next accrual. Null where the policy does
+                not accrue, and for a payroll-held balance. Present only when
+                `include_projected_events` is set.
+              example: '2026-10-01'
+            reset_date:
+              type: [string, 'null']
+              format: date
+              description: >-
+                Date of the balance's next reset. Null where the policy does
+                not reset, and for a payroll-held balance. Present only when
+                `include_projected_events` is set.
+              example: '2027-01-01'
+            activation_date:
+              type: [string, 'null']
+              format: date
+              description: >-
+                Date the balance starts to apply: the employee's start date,
+                advanced by any delay the policy sets. Present only when
+                `include_projected_events` is set.
+              example: '2024-03-01'
+            balance_type:
+              type: [string, 'null']
+              description: >-
+                How the policy's balance behaves. Treat as an open enum. Null
+                where the policy records none. Present only when
+                `include_projected_events` is set.
+              enum: [standard, unlimited, time_worked_accrual, null]
+              example: standard
+            balance_source:
+              type: string
+              description: >-
+                Where the balance is held: `payroll` for a payroll-driven
+                policy, `abbott` otherwise. Treat as an open enum. Present only
+                when `include_projected_events` is set.
+              enum: [abbott, payroll]
+              example: abbott
+        relationships:
+          type: object
+          description: Present only with `include=policy`.
+          properties:
+            policy:
+              type: object
+              properties:
+                data:
+                  $ref: '#/components/schemas/ResourceIdentifier'
+
+    Policy:
+      type: object
+      required: [id, type, attributes]
+      description: >-
+        The rules of a time-off policy, sideloaded with `include=policy`. The
+        policy's name and badge are on each enrolled-policy row, where they
+        are withheld from callers who may not see them.
+      properties:
+        id:
+          type: string
+          description: Unique identifier for the policy.
+          example: '12'
+        type:
+          type: string
+          description: Resource type discriminator.
+          example: policies
+        attributes:
+          type: object
+          description: The policy's accrual and reset rules.
+          required: [accrual, reset, balance_type, unlimited]
+          properties:
+            accrual:
+              description: >-
+                How the balance accrues, or `false` where the policy does not
+                accrue.
+              oneOf:
+                - type: boolean
+                  enum: [false]
+                - type: object
+                  properties:
+                    value:
+                      type: [string, 'null']
+                      description: Amount accrued per interval, in the balance's unit.
+                      example: '15.0'
+                    interval:
+                      type: [string, 'null']
+                      example: yearly
+                    date_string:
+                      type: [string, 'null']
+                      description: The fixed date accrual runs on, where it has one.
+                    accrual_mode:
+                      type: [string, 'null']
+                      example: earned
+                    rounding:
+                      type: [string, 'null']
+                      example: no_rounding
+            reset:
+              description: >-
+                How the balance resets and carries over, or `false` where the
+                policy does not reset.
+              oneOf:
+                - type: boolean
+                  enum: [false]
+                - type: object
+                  properties:
+                    interval:
+                      type: [string, 'null']
+                      example: yearly
+                    date_string:
+                      type: [string, 'null']
+                      description: The fixed date the reset runs on, where it has one.
+                    unlimited_carry_over:
+                      type: [boolean, 'null']
+                    carry_over_limit:
+                      type: [string, 'null']
+                      description: Most that carries over a reset, in the balance's unit.
+                      example: '5.0'
+                    expiry_months:
+                      type: [integer, 'null']
+                      description: Months after the reset that carried-over time expires.
+                    expiry_date_string:
+                      type: [string, 'null']
+            balance_type:
+              type: [string, 'null']
+              description: Same as the enrolled-policy row's `balance_type`.
+              enum: [standard, unlimited, time_worked_accrual, null]
+              example: standard
+            unlimited:
+              type: [boolean, 'null']
+              description: Whether the policy's balance is unlimited.
+              example: false
+
+    AdjustmentEvent:
+      type: object
+      required:
+        - date
+        - purpose
+        - adjusted_value
+        - projected
+        - start_date
+        - end_date
+        - status
+        - comment
+        - time_off_request_id
+      properties:
+        date:
+          type: [string, 'null']
+          format: date
+          description: >-
+            Date the movement applies to the balance. For a payroll-held
+            balance this is the pay date of the period it falls in, not the
+            date the time off was taken.
+          example: '2026-10-15'
+        purpose:
+          type: [string, 'null']
+          description: >-
+            What moved the balance. `accrual` and `payroll_journal` add to it;
+            `request` and `payroll_usage` are bookings that draw it down;
+            `reset`, `reset_negative`, `unlimited_balance_reset`, `expiry`,
+            `reverted_request`, `manual_adjustment` and `import` appear where
+            the policy produces them. Treat as an open enum — new values may be
+            added without a major version bump.
+          example: accrual
+        adjusted_value:
+          type: string
+          description: >-
+            Amount this event moves the balance by, in `balance_unit`, as a
+            signed decimal string — negative for time taken. Add it to a
+            running total to walk the stream.
+
+            Projected `reset` and `reset_negative` amounts are computed
+            against the balance as the projection runs, so they are correct for
+            a walk taken in the order returned and from `current_balance`. One
+            caveat: on a policy that carries its whole balance over, the
+            projection still emits a reset, and that reset does not happen. Such
+            an event overstates the drop at every later date. Payroll-held
+            balances contain no resets and are unaffected.
+          example: '-1.5'
+        dollar_value:
+          type: [string, 'null']
+          description: >-
+            `adjusted_value` expressed in dollars, as a signed decimal string
+            with two places. Present on the events of a balance held in
+            payroll, and absent on other balances' events. Null unless the
+            balance is denominated in dollars, the token identifies a user,
+            and that user is permitted to see the employee's compensation.
+          example: '-287.84'
+        projected:
+          type: boolean
+          description: >-
+            Whether the event is a forecast rather than a movement that has
+            already happened. A projected event can change or not occur.
+          example: true
+        start_date:
+          type: [string, 'null']
+          format: date
+          description: >-
+            First date of the time off this event books. On a projected
+            payroll accrual, the first date of the pay period it accrues for.
+            Null on any other event that is not a booking.
+          example: '2026-10-12'
+        end_date:
+          type: [string, 'null']
+          format: date
+          description: >-
+            Last date of the time off this event books. On a projected payroll
+            accrual, the last date of the pay period it accrues for. Null on
+            any other event that is not a booking.
+          example: '2026-10-14'
+        status:
+          oneOf:
+            - $ref: '#/components/schemas/TimeOffRequestStatus'
+            - type: 'null'
+          description: >-
+            State of the request that booked this event. Null on an event that
+            is not a booking.
+          example: in_review
+        comment:
+          type: [string, 'null']
+          description: >-
+            Note recorded with the movement, such as the reason given for a
+            manual adjustment. Null where none was recorded.
+          example: Carry-over correction
+        time_off_request_id:
+          type: [string, 'null']
+          description: >-
+            Identifier of the time-off request that booked this event, so the
+            events belonging to a request already in hand can be picked out of
+            the stream. Null on an event that is not a booking.
+          example: '4521'
+
+    EnrolledPolicyList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          description: Enrollments for this page, oldest first by record id.
+          items:
+            $ref: '#/components/schemas/EnrolledPolicy'
+        included:
+          type: array
+          description: >-
+            The rows' policies, one per distinct policy, present only with
+            `include=policy`.
+          items:
+            $ref: '#/components/schemas/Policy'
+        meta:
+          type: object
+          properties:
+            count:
+              type: integer
+              description: >-
+                Total enrollments matching the request, not just this page.
+              example: 4
+
+    BalanceAsOfList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          description: The employee's balances, oldest first by record id.
+          items:
+            $ref: '#/components/schemas/BalanceAsOf'
+
+    BalanceAsOf:
+      type: object
+      required:
+        - id
+        - as_of
+        - balance_as_of
+        - balance
+        - current_balance
+        - balance_unit
+        - status
+      properties:
+        id:
+          type: string
+          description: >-
+            The balance identifier, as on `listEmployeeEnrolledPolicies`.
+          example: '23'
+        as_of:
+          type: string
+          format: date
+          description: The date requested.
+        balance_as_of:
+          type: [string, 'null']
+          format: date
+          description: >-
+            The date `balance` is measured at. The requested date for a balance
+            held here; for a payroll-held balance, the last pay date on or
+            before it. Null when there is no balance, for a payroll-held
+            balance with no pay date in the last 90 days, and for today's
+            figure on a payroll-held balance that cannot be estimated.
+        balance:
+          type: [string, 'null']
+          description: >-
+            The balance on `balance_as_of`, in `balance_unit`, as a decimal
+            string. Null unless `status` is `projected`.
+          example: '12.5'
+        current_balance:
+          type: [string, 'null']
+          description: >-
+            The balance right now, as on `listEmployeeEnrolledPolicies`. Null
+            for an unlimited policy.
+          example: '10.0'
+        balance_unit:
+          $ref: '#/components/schemas/BalanceUnit'
+        status:
+          type: string
+          description: >-
+            `projected` when `balance` is set; `unlimited` for a policy with no
+            balance; `no_estimate` when the payroll service holds no balance to
+            read for a payroll-held policy, or cannot estimate it for that date.
+            Treat as an open enum.
+          enum:
+            - projected
+            - no_estimate
+            - unlimited
+
+    ProblemDetail:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        request_id: { type: string }
+      additionalProperties: true
+
+    Error:
+      type: object
+      description: Uniform error envelope returned for 4xx and 5xx responses.
+      required: [errors]
+      properties:
+        errors:
+          type: array
+          items:
+            type: object
+            required: [code, detail]
+            properties:
+              code:
+                type: string
+                description: Short machine-readable error identifier.
+                example: invalid_params
+              detail:
+                type: string
+                description: Human-readable explanation.
+                example: 'unsupported parameter(s): statuss'
+        request_id:
+          type: string
+          description: Echoes the gateway-assigned `X-Request-Id` when present.
+          example: 550e8400-e29b-41d4-a716-446655440000
+
+  headers:
+    X-Request-Id:
+      description: Gateway-assigned request correlation id.
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: >-
+        Malformed or unsupported request — an unknown parameter, an
+        out-of-range `page[size]`, or a missing `employee_id` on a token with no
+        user.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing, malformed, or unacceptable token.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Token lacks a scope required for this operation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    NotAcceptable:
+      description: >-
+        The Accept header asks for a media type this endpoint does not serve.
+        `application/json`, `application/vnd.api+json`, `*/*` and a missing
+        header are all accepted.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooManyRequests:
+      description: Rate limit exceeded.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    IdempotencyLengthRequired:
+      description: >-
+        Gateway-reported, type `idempotency-content-length-required`: a request
+        carrying `Idempotency-Key` was sent without a `Content-Length`, so the
+        gateway cannot fingerprint the body. Send the body with its length.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    IdempotencyPayloadTooLarge:
+      description: >-
+        Gateway-reported, type `idempotency-payload-too-large`: a request
+        carrying `Idempotency-Key` has a body larger than the gateway will
+        buffer for idempotency.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    InternalServerError:
+      description: Internal server error. The body carries no diagnostic detail.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    ServiceUnavailable:
+      description: >-
+        A service this operation depends on could not be reached. The request
+        can be retried.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  securitySchemes:
+    BearerAuth:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://api.risepeople.com/v1/oauth/token
+          scopes:
+            time_off:read: Read time-off requests, reviews and balances
+            time_off:write: Create time-off requests and review responses
+    BearerUserAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

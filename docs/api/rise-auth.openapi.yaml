@@ -1,0 +1,1335 @@
+openapi: "3.1.0"
+info:
+  title: Rise Authentication — OAuth 2.0
+  version: "1.0.0"
+  description: OAuth 2.0 authorization server endpoints for the Rise People Public API.
+servers:
+  - url: https://api.risepeople.com
+
+paths:
+  # ---------------------------------------------------------------------------
+  # Public Endpoints (no auth required)
+  # ---------------------------------------------------------------------------
+
+  /oauth/token:
+    post:
+      operationId: createToken
+      summary: Issue an access token
+      description: |
+        OAuth 2.0 Token Endpoint (RFC 6749 §3.2). Supports `client_credentials`,
+        `authorization_code` (with PKCE), and `refresh_token` grant types.
+      tags: [OAuth]
+      # Public endpoint — client credentials travel in the body, not the Authorization header.
+      security: []
+      x-rise-scope: []
+      x-rise-rate-limit: 50 req/min per IP
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: "#/components/schemas/TokenRequest"
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenRequest"
+      responses:
+        "200":
+          description: Token issued successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+        "400":
+          description: Invalid grant, unsupported grant type, or invalid scope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+        "401":
+          description: Invalid client credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+
+  /oauth/revoke:
+    post:
+      operationId: revokeToken
+      summary: Revoke an access or refresh token
+      description: |
+        OAuth 2.0 Token Revocation Endpoint (RFC 7009). Returns 200 for any
+        valid request regardless of whether the token existed, per the RFC.
+      tags: [OAuth]
+      # Public endpoint — credentials are supplied in the body.
+      security: []
+      x-rise-scope: []
+      x-rise-rate-limit: 20 req/min per IP
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [token, client_id, client_secret]
+              properties:
+                token:
+                  type: string
+                  description: The access_token or refresh_token to revoke.
+                client_id:
+                  type: string
+                  format: uuid
+                client_secret:
+                  type: string
+      responses:
+        "200":
+          description: Token revoked (or was already invalid)
+        "400":
+          description: Malformed revocation request (missing token, client_id, or client_secret).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+        "401":
+          description: Invalid client credentials.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+        "429":
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+
+  /.well-known/jwks.json:
+    get:
+      operationId: getJwks
+      summary: JSON Web Key Set
+      description: |
+        Returns the public key(s) used to verify RS256-signed OAuth access tokens.
+        Cached for 1 hour by Zuul.
+      tags: [OAuth]
+      # Public — JWKS must be reachable without a token so clients can verify signatures.
+      security: []
+      x-rise-scope: []
+      responses:
+        "200":
+          description: JWKS key set
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: public, max-age=3600
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JwksKeySet"
+        "500":
+          description: Unexpected error while loading the key set.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+
+  /oauth/authorize:
+    get:
+      operationId: getConsentData
+      summary: Retrieve consent screen data
+      description: |
+        Validates the authorization request and returns metadata for the consent
+        screen. Browser requests (Accept: text/html) are redirected by Zuul to
+        the SPA; API requests (Accept: application/json) return JSON.
+      tags: [OAuth]
+      x-rise-scope: []
+      x-rise-internal: true
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: response_type
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [code]
+        - name: client_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: redirect_uri
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uri
+        - name: scope
+          in: query
+          required: true
+          schema:
+            type: string
+            description: Space-separated scope strings.
+            example: reports:read user:read
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: code_challenge
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: code_challenge_method
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [S256]
+      responses:
+        "200":
+          description: Consent screen data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConsentData"
+        "400":
+          description: >
+            Invalid client, redirect URI, or PKCE params; or `invalid_scope`
+            when no requested scope is available to the organization. The
+            `invalid_scope` body carries `redirect_uri` so the caller can
+            report the failure to the client (RFC 6749 §4.1.2.1).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+    post:
+      operationId: submitConsent
+      summary: Approve or deny authorization request
+      description: |
+        Accepts the user's consent decision. If approved, returns a redirect URI
+        containing the authorization code. If denied, returns a redirect URI with
+        `error=access_denied`.
+      tags: [OAuth]
+      x-rise-scope: []
+      x-rise-internal: true
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approved, redirect_uri, code_challenge, code_challenge_method]
+              properties:
+                approved:
+                  type: string
+                  enum: ["0", "1"]
+                  description: '"1" to approve, "0" to deny.'
+                approved_scopes:
+                  type: array
+                  items:
+                    type: string
+                  description: Scope strings the user selected (approval only).
+                redirect_uri:
+                  type: string
+                  format: uri
+                code_challenge:
+                  type: string
+                code_challenge_method:
+                  type: string
+                  enum: [S256]
+                state:
+                  type: string
+      responses:
+        "200":
+          description: Redirect URI returned as JSON (for AJAX callers)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  redirect_uri:
+                    type: string
+                    format: uri
+        "302":
+          description: Browser redirect to callback URI with code or error
+        "400":
+          description: Invalid scope or PKCE params
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+
+  # ---------------------------------------------------------------------------
+  # Application Management (session auth + manage_oauth_applications permission)
+  # ---------------------------------------------------------------------------
+
+  /oauth/applications:
+    get:
+      operationId: listApplications
+      summary: List OAuth applications for the user's organization
+      tags: [Applications]
+      x-rise-scope: ["applications:read"]
+      x-rise-internal: true
+      security:
+        - sessionAuth: []
+      responses:
+        "200":
+          description: List of applications
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/OauthApplication"
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+        "403":
+          description: Missing manage_oauth_applications permission
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+        "404":
+          description: Feature flag is off for this organization
+    post:
+      operationId: createApplication
+      summary: Create a new OAuth application
+      description: |
+        Returns the `client_secret` in plaintext. This is the **only time** the
+        secret is shown — it cannot be retrieved later.
+      tags: [Applications]
+      x-rise-scope: ["applications:write"]
+      x-rise-internal: true
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, scopes]
+              properties:
+                name:
+                  type: string
+                scopes:
+                  type: array
+                  items:
+                    type: string
+                redirect_uri:
+                  type: string
+                  format: uri
+                logo_uri:
+                  type: string
+                  format: uri
+                service_user_id:
+                  type: integer
+                  description: |
+                    The user whose permissions client_credentials tokens carry.
+                    Unless the caller is a support user (provider_support), it must be the caller.
+      responses:
+        "201":
+          description: Application created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OauthApplicationCreate"
+        "403":
+          description: service_user_id is not the caller
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+        "422":
+          description: Validation error (invalid scopes, missing name)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationError"
+
+  /oauth/applications/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+    get:
+      operationId: getApplication
+      summary: Get a single OAuth application
+      tags: [Applications]
+      x-rise-scope: ["applications:read"]
+      x-rise-internal: true
+      security:
+        - sessionAuth: []
+      responses:
+        "200":
+          description: Application details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OauthApplication"
+        "404":
+          description: Application not found or wrong organization
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+    patch:
+      operationId: updateApplication
+      summary: Update an OAuth application
+      description: |
+        If scopes change, all existing grants' tokens are revoked (the app's
+        scope ceiling changed and existing tokens may exceed it).
+      tags: [Applications]
+      x-rise-scope: ["applications:write"]
+      x-rise-internal: true
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                scopes:
+                  type: array
+                  items:
+                    type: string
+                redirect_uri:
+                  type: string
+                  format: uri
+                logo_uri:
+                  type: string
+                  format: uri
+                active:
+                  type: boolean
+                service_user_id:
+                  type: integer
+                  description: |
+                    The user whose permissions client_credentials tokens carry.
+                    Unless the caller is a support user (provider_support), it must be the caller.
+      responses:
+        "200":
+          description: Updated application
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OauthApplication"
+        "403":
+          description: service_user_id changes to a user other than the caller
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+        "422":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationError"
+    delete:
+      operationId: deleteApplication
+      summary: Delete an OAuth application
+      description: |
+        Revokes all active grants (cascading to tokens and Redis JTI denylist)
+        before destroying the application record.
+      tags: [Applications]
+      x-rise-scope: ["applications:write"]
+      x-rise-internal: true
+      security:
+        - sessionAuth: []
+      responses:
+        "204":
+          description: Application deleted
+        "404":
+          description: Application not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+
+  /oauth/applications/{id}/rotate_secret:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+    post:
+      operationId: rotateApplicationSecret
+      summary: Rotate the client secret
+      description: |
+        Generates a new `client_secret` and revokes all grants' tokens (existing
+        refresh tokens can no longer authenticate with the old secret). Returns
+        the new plaintext secret — this is the **only time** it is shown.
+      tags: [Applications]
+      x-rise-scope: ["applications:write"]
+      x-rise-internal: true
+      security:
+        - sessionAuth: []
+      responses:
+        "200":
+          description: New secret issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OauthApplicationCreate"
+        "403":
+          description: The caller is not the application's service user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+        "404":
+          description: Application not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+
+  # ---------------------------------------------------------------------------
+  # Grant Management (session auth, user's own grants only)
+  # ---------------------------------------------------------------------------
+
+  /oauth/grants:
+    get:
+      operationId: listGrants
+      summary: List the current user's active OAuth grants
+      tags: [Grants]
+      x-rise-scope: []
+      x-rise-internal: true
+      security:
+        - sessionAuth: []
+      responses:
+        "200":
+          description: List of active grants
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/OauthGrant"
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+
+  /oauth/grants/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+    patch:
+      operationId: updateGrant
+      summary: Modify the approved scopes on a grant
+      description: |
+        Updates the scope set. All existing access and refresh tokens for the
+        grant are revoked immediately and their JTIs written to Redis denylist.
+      tags: [Grants]
+      x-rise-scope: []
+      x-rise-internal: true
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scopes]
+              properties:
+                scopes:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: Updated grant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OauthGrant"
+        "404":
+          description: Grant not found or already revoked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+        "422":
+          description: Invalid scopes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+    delete:
+      operationId: revokeGrant
+      summary: Revoke a grant and all its tokens
+      description: |
+        Revokes the grant and cascades to all associated tokens. Active JTIs are
+        written to the Redis denylist before the DB update.
+      tags: [Grants]
+      x-rise-scope: []
+      x-rise-internal: true
+      security:
+        - sessionAuth: []
+      responses:
+        "204":
+          description: Grant revoked
+        "404":
+          description: Grant not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthError"
+
+  # ---------------------------------------------------------------------------
+  # OpenID Connect UserInfo
+  # ---------------------------------------------------------------------------
+
+  /oauth/userinfo:
+    get:
+      operationId: getUserInfo
+      summary: Get the authenticated user's profile
+      description: |
+        OIDC UserInfo Endpoint (OIDC Core §5.3). Protected by OAuthBearerFilter
+        in the gateway — requires an OAuth Bearer token from an Authorization
+        Code grant.
+      tags: [OAuth]
+      x-rise-scope: ["user:read"]
+      security:
+        - oauth2: [user:read]
+      responses:
+        "200":
+          description: User profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserInfo"
+        "401":
+          description: Missing or invalid Bearer token
+
+  /features:
+    get:
+      operationId: getFeatures
+      summary: Read the current organization's enabled features
+      description: |
+        Returns the enabled products for the authenticated caller's organization.
+        Accepts a session token or an OAuth token bound to an active organization
+        member, including a client_credentials token bound to a service user.
+        Requires the existing feature-read permission and no OAuth resource scope.
+        OAuth callers are pinned to the organization in the signed identity.
+        Session callers retain the existing provider-support organization override.
+      tags: [Features]
+      x-rise-scope: []
+      security:
+        - oauth2: []
+      responses:
+        "200":
+          description: Enabled features for the caller's organization
+          content:
+            application/vnd.api+json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, type, attributes]
+                      properties:
+                        id:
+                          type: string
+                        type:
+                          type: string
+                          const: features
+                        attributes:
+                          type: object
+                          required: [name, enabled]
+                          properties:
+                            name:
+                              type: string
+                            enabled:
+                              type: boolean
+        "401":
+          description: Missing, expired, revoked, or invalid token
+        "403":
+          description: Missing active organization membership or feature-read permission
+
+  # ---------------------------------------------------------------------------
+  # Rise AI company setting (AI-427)
+  # ---------------------------------------------------------------------------
+
+  /organizations/{organization_id}/rise_ai_setting:
+    parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: integer
+    get:
+      operationId: getRiseAiSetting
+      summary: Read the organization's Rise AI setting
+      description: |
+        Whether an account owner has turned Rise AI on or off for the organization,
+        who decided, the active account owners' names and the policy links in the
+        caller's language. Rise AI is on until someone turns it off: with no decision
+        the status is `on` and `decided_at` and `decided_by` are null.
+        Answers any active user of the organization, through a
+        session token or an OAuth token issued on their behalf; requires no scope.
+        A client_credentials token, or a token for a user outside the organization, gets 403.
+        An OAuth caller gets no names: `owners` is empty and the `decided_by` names are null.
+        `external_ai` is the separate External AI setting (third-party MCP clients such as
+        ChatGPT and Claude), decided apart from Rise AI with its own time and decider; it is
+        also `on` until someone turns it off.
+        `viewer_acknowledgement` is the caller's latest acknowledgement of the Rise AI data
+        notice, and is null for an OAuth caller.
+      tags: [Rise AI]
+      x-rise-scope: []
+      security:
+        - oauth2: []
+        - sessionAuth: []
+      responses:
+        "200":
+          description: The organization's Rise AI setting
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RiseAiSetting"
+        "401":
+          description: Missing or invalid token
+        "403":
+          description: The caller is not an active user of this organization
+    patch:
+      operationId: updateRiseAiSetting
+      summary: Turn Rise AI or External AI on or off for the organization
+      description: |
+        An account owner of the organization (manage_rise_ai), through a session token,
+        turns Rise AI, External AI, or both on or off. Each field sent records its own
+        decider, source and time; a field not sent keeps its decision. A decision made while
+        impersonating the owner is recorded with source `support`. An OAuth token gets 401;
+        a user without manage_rise_ai, or outside the organization, gets 403.
+      tags: [Rise AI]
+      x-rise-scope: []
+      x-rise-internal: true
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              anyOf:
+                - required: [status]
+                - required: [external_ai_status]
+              properties:
+                status:
+                  type: string
+                  enum: ["on", "off"]
+                external_ai_status:
+                  type: string
+                  enum: ["on", "off"]
+      responses:
+        "200":
+          description: The organization's Rise AI setting after the change
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RiseAiSetting"
+        "401":
+          description: Missing or invalid session token, or an OAuth token
+        "403":
+          description: The caller cannot manage Rise AI for this organization
+        "422":
+          description: |
+            Neither field was sent, or a field is not `on` or `off`. `error` is
+            `invalid_status` or `invalid_external_ai_status`, and nothing is changed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, allowed]
+                properties:
+                  error:
+                    type: string
+                    enum: [invalid_status, invalid_external_ai_status]
+                  allowed:
+                    type: array
+                    items:
+                      type: string
+
+  /organizations/{organization_id}/rise_ai_setting/status:
+    parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: integer
+    get:
+      operationId: getRiseAiSettingStatus
+      summary: Read whether Rise AI and External AI are on for the organization
+      description: |
+        The organization's Rise AI and External AI statuses only, for enforcement checks. Any active
+        user of the organization, through a session token or an OAuth token
+        (authorization_code, or client_credentials for an application of this
+        organization); requires no scope. An interservice token, or a token bound to
+        another organization, gets 403.
+      tags: [Rise AI]
+      x-rise-scope: []
+      security:
+        - oauth2: []
+        - sessionAuth: []
+      responses:
+        "200":
+          description: The organization's Rise AI status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, external_ai_status]
+                properties:
+                  status:
+                    type: string
+                    enum: ["on", "off"]
+                  external_ai_status:
+                    type: string
+                    enum: ["on", "off"]
+        "401":
+          description: Missing or invalid token
+        "403":
+          description: The caller is not an active user of this organization
+
+  /organizations/{organization_id}/rise_ai_setting/acknowledgement:
+    parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: integer
+    post:
+      operationId: createRiseAiAcknowledgement
+      summary: Record that the caller acknowledged the Rise AI data notice
+      description: |
+        Records that the caller, any active user of the organization, acknowledged the
+        given version of the Rise AI data notice, in the given locale.
+        Session token only, and not an impersonation: each user acknowledges for
+        themselves. The client owns the version string; water stores it as sent and
+        does not judge which version is current. One record per user and version:
+        a repeat of the same version keeps the first record and answers 200 with it.
+      tags: [Rise AI]
+      x-rise-scope: []
+      x-rise-internal: true
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [notice_version, locale]
+              properties:
+                notice_version:
+                  type: string
+                  minLength: 1
+                  maxLength: 64
+                  description: Printable characters, with no leading or trailing space and no invisible format character.
+                locale:
+                  type: string
+                  enum: [en, fr]
+      responses:
+        "201":
+          description: The acknowledgement was recorded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RiseAiAcknowledgement"
+        "200":
+          description: The caller had already acknowledged this version; the first record is answered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RiseAiAcknowledgement"
+        "401":
+          description: Missing or invalid session token, or an OAuth, interservice or resource-scoped token
+        "403":
+          description: |
+            The caller is not an active user of this organization, or the
+            session is support impersonating a user (error impersonated_session)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: [impersonated_session]
+        "422":
+          description: The notice_version or the locale is missing or invalid; nothing was stored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    enum: [invalid_notice_version, invalid_locale]
+                  allowed:
+                    type: array
+                    items:
+                      type: string
+
+# =============================================================================
+# Components
+# =============================================================================
+
+components:
+
+  # ---------------------------------------------------------------------------
+  # Security Schemes
+  # ---------------------------------------------------------------------------
+  securitySchemes:
+    oauth2:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: /oauth/token
+          scopes:
+            reports:read: View payroll and analytics reports
+            reports:write: Create saved reports and other write operations
+            user:read: View user profiles and directory information
+            user:write: Create and update user profiles
+        authorizationCode:
+          authorizationUrl: /oauth/authorize
+          tokenUrl: /oauth/token
+          scopes:
+            reports:read: View payroll and analytics reports
+            reports:write: Create saved reports and other write operations
+            user:read: View user profiles and directory information
+            user:write: Create and update user profiles
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    sessionAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Rise internal session token (for application/grant management endpoints)
+
+  # ---------------------------------------------------------------------------
+  # Schemas
+  # ---------------------------------------------------------------------------
+  schemas:
+    RiseAiPerson:
+      type: object
+      required: [first_name, name]
+      properties:
+        first_name:
+          type: [string, "null"]
+        name:
+          type: [string, "null"]
+    RiseAiAcknowledgement:
+      type: object
+      required: [notice_version, acknowledged_at]
+      properties:
+        notice_version:
+          type: string
+        acknowledged_at:
+          type: string
+          format: date-time
+    RiseAiDecider:
+      oneOf:
+        - type: "null"
+        - allOf:
+            - $ref: "#/components/schemas/RiseAiPerson"
+            - type: object
+              required: [source]
+              properties:
+                source:
+                  type: string
+                  enum: [owner, support]
+    RiseAiExternalAiSetting:
+      type: object
+      required: [status, decided_at, decided_by]
+      properties:
+        status:
+          type: string
+          enum: ["on", "off"]
+        decided_at:
+          type: [string, "null"]
+          format: date-time
+        decided_by:
+          $ref: "#/components/schemas/RiseAiDecider"
+    RiseAiSetting:
+      type: object
+      required: [organization, status, decided_at, decided_by, external_ai, owners, viewer_is_owner, viewer_last_request_at, viewer_acknowledgement, policy_links]
+      properties:
+        organization:
+          type: object
+          required: [id, name]
+          properties:
+            id:
+              type: integer
+            name:
+              type: [string, "null"]
+        status:
+          type: string
+          enum: ["on", "off"]
+        decided_at:
+          type: [string, "null"]
+          format: date-time
+        decided_by:
+          $ref: "#/components/schemas/RiseAiDecider"
+        external_ai:
+          $ref: "#/components/schemas/RiseAiExternalAiSetting"
+        owners:
+          type: array
+          items:
+            $ref: "#/components/schemas/RiseAiPerson"
+        viewer_is_owner:
+          type: boolean
+        viewer_last_request_at:
+          type: [string, "null"]
+          format: date-time
+        viewer_acknowledgement:
+          description: |
+            The caller's latest acknowledgement of the Rise AI data notice in this
+            organization, or null. Always null for an OAuth caller.
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/RiseAiAcknowledgement"
+        policy_links:
+          type: object
+          required: [privacy_policy, ai_usage_policy, data_handling]
+          properties:
+            privacy_policy:
+              type: string
+              format: uri
+            ai_usage_policy:
+              type: string
+              format: uri
+            data_handling:
+              type: string
+              format: uri
+    TokenRequest:
+      type: object
+      required: [grant_type, client_id]
+      properties:
+        grant_type:
+          type: string
+          enum: [client_credentials, authorization_code, refresh_token]
+          description: OAuth 2.0 grant type (RFC 6749).
+        client_id:
+          type: string
+          format: uuid
+          description: UUID identifying the OAuth application.
+        client_secret:
+          type: string
+          description: Required for client_credentials and refresh_token. Optional for authorization_code with PKCE.
+        scope:
+          type: string
+          description: Space-separated scope strings (client_credentials only).
+        code:
+          type: string
+          description: Authorization code (authorization_code grant only).
+        redirect_uri:
+          type: string
+          format: uri
+          description: Must match the registered URI (authorization_code grant only).
+        code_verifier:
+          type: string
+          description: PKCE verifier (authorization_code grant only).
+        refresh_token:
+          type: string
+          description: The refresh token to exchange (refresh_token grant only).
+
+    TokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in]
+      properties:
+        access_token:
+          type: string
+          description: Signed JWT bearer token to send in the Authorization header.
+        token_type:
+          type: string
+          enum: [Bearer]
+          description: Always `Bearer` per RFC 6750.
+        expires_in:
+          type: integer
+          description: Token lifetime in seconds.
+          example: 3600
+        scope:
+          type: string
+          description: Space-separated granted scopes.
+        refresh_token:
+          type: string
+          description: Issued for authorization_code and refresh_token grants only.
+
+    OAuthError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Error code per RFC 6749 §5.2.
+          example: invalid_client
+        error_description:
+          type: string
+          description: Human-readable error detail.
+        redirect_uri:
+          type: string
+          format: uri
+          description: >
+            Present when the failure must be reported to the client through its
+            redirect URI (RFC 6749 §4.1.2.1) — currently `invalid_scope` from
+            GET /oauth/authorize. Send the user agent here.
+
+    ValidationError:
+      type: object
+      properties:
+        error:
+          type: string
+          example: validation_error
+          description: Error code indicating the category of validation failure.
+        errors:
+          type: array
+          items:
+            type: string
+          description: Human-readable validation error messages, one per failed rule.
+
+    OauthApplication:
+      type: object
+      properties:
+        id:
+          type: integer
+          description: Internal numeric identifier for the application.
+        name:
+          type: string
+          description: Human-readable application name shown on the consent screen.
+        client_id:
+          type: string
+          format: uuid
+          description: Public client identifier used in OAuth flows.
+        scopes:
+          type: array
+          items:
+            type: string
+          description: Scopes this application is allowed to request.
+        redirect_uri:
+          type: string
+          format: uri
+          description: Callback URI used for authorization_code grants.
+        logo_uri:
+          type: string
+          format: uri
+          description: URL of the logo displayed on the consent screen.
+        active:
+          type: boolean
+          description: Whether the application can issue new tokens.
+        created_at:
+          type: string
+          format: date-time
+          description: Timestamp the application was created.
+        updated_at:
+          type: string
+          format: date-time
+          description: Timestamp of the most recent modification.
+        grants_count:
+          type: integer
+          description: Number of users who have authorized this application.
+        active_tokens_count:
+          type: integer
+          description: Number of currently valid access/refresh tokens issued.
+        service_user_email:
+          type: string
+          nullable: true
+          description: |
+            Email of the user whose permissions client_credentials tokens carry.
+            Null when the application has no service user or the caller cannot manage it.
+        can_rotate_secret:
+          type: boolean
+          description: Whether the caller may rotate this application's secret.
+
+    OauthApplicationCreate:
+      description: Application with plaintext client_secret (shown only on creation or secret rotation).
+      allOf:
+        - $ref: "#/components/schemas/OauthApplication"
+        - type: object
+          properties:
+            client_secret:
+              type: string
+              description: Plaintext secret — shown once, cannot be retrieved later.
+
+    OauthGrant:
+      type: object
+      properties:
+        id:
+          type: integer
+          description: Internal numeric identifier for the grant.
+        application:
+          type: object
+          description: Summary of the OAuth application this grant was issued to.
+          properties:
+            client_id:
+              type: string
+              format: uuid
+            name:
+              type: string
+            logo_uri:
+              type: string
+              format: uri
+        scopes:
+          type: array
+          items:
+            type: string
+          description: Scopes the user has consented to.
+        created_at:
+          type: string
+          format: date-time
+          description: Timestamp the grant was issued.
+        updated_at:
+          type: string
+          format: date-time
+          description: Timestamp of the most recent scope change.
+
+    ConsentData:
+      type: object
+      properties:
+        client_id:
+          type: string
+          format: uuid
+          description: Client ID of the requesting application.
+        name:
+          type: string
+          description: Application name to display on the consent screen.
+        logo_uri:
+          type: string
+          format: uri
+          description: Application logo to display on the consent screen.
+        scopes:
+          type: object
+          description: >
+            Scopes offered on the consent screen. A requested scope the
+            organization cannot grant is omitted; when nothing survives, the
+            endpoint returns `invalid_scope` instead of consent data.
+          properties:
+            selectable:
+              type: array
+              items:
+                $ref: "#/components/schemas/ScopeEntry"
+
+    ScopeEntry:
+      type: object
+      properties:
+        key:
+          type: string
+          example: reports:read
+          description: Canonical scope string in `resource:action` form.
+        category:
+          type: string
+          example: Reports
+          description: Top-level grouping shown on the consent screen.
+        resource:
+          type: string
+          example: Reports
+          description: Resource portion of the scope key.
+        action:
+          type: string
+          enum: [read, write]
+          description: Action portion of the scope key.
+        label:
+          type: string
+          example: Read reports
+          description: Display label shown in consent UI.
+        name:
+          type: string
+          description: Backward-compatible alias for label.
+        description:
+          type: string
+          description: Long-form explanation of what the scope grants access to.
+        sort_order:
+          type: integer
+          description: Sort position within its category on the consent screen.
+
+    UserInfo:
+      type: object
+      description: OIDC UserInfo claims for the authenticated user.
+      properties:
+        sub:
+          type: string
+          description: Stable identifier for the user.
+        name:
+          type: string
+          description: Display name of the user.
+        email:
+          type: string
+          format: email
+          description: Primary email address of the user.
+
+    JwksKeySet:
+      type: object
+      properties:
+        keys:
+          type: array
+          description: Array of public keys in JWK format (RFC 7517).
+          items:
+            type: object
+            properties:
+              kty:
+                type: string
+                example: RSA
+              alg:
+                type: string
+                example: RS256
+              use:
+                type: string
+                example: sig
+              kid:
+                type: string
+              n:
+                type: string
+                description: RSA modulus (Base64url-encoded).
+              e:
+                type: string
+                description: RSA exponent (Base64url-encoded).
+                example: AQAB
+
+tags:
+  - name: Features
+    description: Authenticated organization product discovery
+  - name: OAuth
+    description: OAuth 2.0 protocol endpoints (token, authorize, revoke, JWKS, userinfo)
+  - name: Applications
+    description: CRUD management of OAuth applications (requires session auth + permission)
+  - name: Grants
+    description: User grant management — view and revoke authorized applications
